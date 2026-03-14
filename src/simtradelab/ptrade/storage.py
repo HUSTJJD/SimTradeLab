@@ -16,8 +16,16 @@ import pandas as pd
 from pathlib import Path
 
 
+def _ensure_datetime_series(dt_series: pd.Series) -> pd.Series:
+    """确保日期列可安全使用 .dt 访问器。"""
+    if pd.api.types.is_datetime64_any_dtype(dt_series):
+        return dt_series
+    return pd.to_datetime(dt_series, errors='coerce')
+
+
 def _date_to_int(dt_series: pd.Series) -> pd.Series:
     """向量化将datetime转为YYYYMMDD整数"""
+    dt_series = _ensure_datetime_series(dt_series)
     return (
         dt_series.dt.year * 10000 +
         dt_series.dt.month * 100 +
@@ -27,6 +35,7 @@ def _date_to_int(dt_series: pd.Series) -> pd.Series:
 
 def _date_to_iso(dt_series: pd.Series) -> pd.Series:
     """向量化将datetime转为YYYY-MM-DD字符串"""
+    dt_series = _ensure_datetime_series(dt_series)
     return (
         dt_series.dt.year.astype(str) + '-' +
         dt_series.dt.month.astype(str).str.zfill(2) + '-' +
@@ -40,7 +49,11 @@ def load_stock(data_dir, symbol):
     if parquet_file.exists():
         df = pd.read_parquet(parquet_file)
         if not df.empty and 'date' in df.columns:
+            df = df.copy()
+            df['date'] = _ensure_datetime_series(df['date'])
+            df.dropna(subset=['date'], inplace=True)
             df.set_index('date', inplace=True)
+            df.sort_index(inplace=True)
         return df
     return pd.DataFrame()
 
@@ -51,7 +64,11 @@ def load_valuation(data_dir, symbol):
     if parquet_file.exists():
         df = pd.read_parquet(parquet_file)
         if not df.empty and 'date' in df.columns:
+            df = df.copy()
+            df['date'] = _ensure_datetime_series(df['date'])
+            df.dropna(subset=['date'], inplace=True)
             df.set_index('date', inplace=True)
+            df.sort_index(inplace=True)
         return df
     return pd.DataFrame()
 
@@ -62,7 +79,11 @@ def load_fundamentals(data_dir, symbol):
     if parquet_file.exists():
         df = pd.read_parquet(parquet_file)
         if not df.empty and 'date' in df.columns:
+            df = df.copy()
+            df['date'] = _ensure_datetime_series(df['date'])
+            df.dropna(subset=['date'], inplace=True)
             df.set_index('date', inplace=True)
+            df.sort_index(inplace=True)
         return df
     return pd.DataFrame()
 
@@ -333,10 +354,16 @@ def load_stock_1m(data_dir, symbol, simulate_if_missing=True):
     if parquet_file.exists():
         df = pd.read_parquet(parquet_file)
         if not df.empty:
+            df = df.copy()
             if 'datetime' in df.columns:
+                df['datetime'] = _ensure_datetime_series(df['datetime'])
+                df.dropna(subset=['datetime'], inplace=True)
                 df.set_index('datetime', inplace=True)
             elif 'date' in df.columns:
+                df['date'] = _ensure_datetime_series(df['date'])
+                df.dropna(subset=['date'], inplace=True)
                 df.set_index('date', inplace=True)
+            df.sort_index(inplace=True)
         return df
 
     # 如果真实分钟数据不存在且允许模拟，则基于日线数据模拟
