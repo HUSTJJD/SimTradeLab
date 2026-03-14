@@ -29,6 +29,12 @@ class BacktestStats:
     daily_cash_liability: list[float] = field(default_factory=list)
     daily_sec_liability: list[float] = field(default_factory=list)
     daily_margin_interest: list[float] = field(default_factory=list)
+    daily_total_debit: list[float] = field(default_factory=list)
+    daily_enable_bail_balance: list[float] = field(default_factory=list)
+    daily_maintenance_margin_rate: list[float] = field(default_factory=list)
+    daily_assure_asset: list[float] = field(default_factory=list)
+    daily_net_asset: list[float] = field(default_factory=list)
+    daily_available_cash: list[float] = field(default_factory=list)
     trade_dates: list = field(default_factory=list)
     daily_positions_snapshot: list[list] = field(default_factory=list)
 
@@ -46,11 +52,7 @@ class StatsCollector:
         return self._stats
 
     def collect_pre_trading(self, context: Context, current_date):
-        """收集交易前数据"""
-        self._stats.portfolio_values.append(context.portfolio.portfolio_value)
-        self._stats.positions_count.append(
-            sum(1 for p in context.portfolio.positions.values() if p.amount > 0)
-        )
+        """收集交易日前置数据。"""
         self._stats.trade_dates.append(current_date)
 
     def collect_trading_amounts(self, context: Context):
@@ -62,9 +64,14 @@ class StatsCollector:
         context._daily_buy_commission = 0.0
 
     def collect_post_trading(self, context: Context, prev_portfolio_value: float):
-        """收集交易后数据"""
+        """收集交易后数据。"""
         current_value = context.portfolio.portfolio_value
         daily_pnl = current_value - prev_portfolio_value
+
+        self._stats.portfolio_values.append(current_value)
+        self._stats.positions_count.append(
+            sum(1 for p in context.portfolio.positions.values() if p.amount > 0)
+        )
         self._stats.daily_pnl.append(daily_pnl)
         self._stats.daily_positions_value.append(context.portfolio.positions_value)
 
@@ -72,6 +79,12 @@ class StatsCollector:
         self._stats.daily_cash_liability.append(margin_summary.get('cash_liability', 0.0))
         self._stats.daily_sec_liability.append(margin_summary.get('sec_liability', 0.0))
         self._stats.daily_margin_interest.append(margin_summary.get('interest', 0.0))
+        self._stats.daily_total_debit.append(margin_summary.get('total_debit', 0.0))
+        self._stats.daily_enable_bail_balance.append(margin_summary.get('enable_bail_balance', 0.0))
+        self._stats.daily_maintenance_margin_rate.append(margin_summary.get('maintenance_margin_rate', 0.0))
+        self._stats.daily_assure_asset.append(margin_summary.get('assure_asset', 0.0))
+        self._stats.daily_net_asset.append(margin_summary.get('net_asset', 0.0))
+        self._stats.daily_available_cash.append(margin_summary.get('available_cash', context.portfolio.available_cash))
 
         snapshot = [
             {

@@ -46,58 +46,94 @@ class OrderProcessor:
         self.get_stock_date_index = get_stock_date_index_func
         self.log = log
 
-    def get_execution_price(self, stock: str, limit_price: Optional[float] = None, is_buy: bool = True) -> Optional[float]:
-        """获取交易执行价格（含滑点）
-
-        Args:
-            stock: 股票代码
-            limit_price: 限价
-            is_buy: 是否买入（True买入向上滑点，False卖出向下滑点）
-
-        Returns:
-            执行价格，失败返回None
-        """
-        if limit_price is not None:
-            base_price = limit_price
+    def _get_bar_context(self, stock: str) -> tuple[Optional[pd.DataFrame], Optional[int], str]:
+        """返回当前交易上下文对应的数据表与索引。"""
+        frequency = getattr(self.context, 'frequency', '1d')
+        if frequency == '1m' and self.data_context.stock_data_dict_1m is not None:
+            data_source = self.data_context.stock_data_dict_1m
         else:
-            # 根据frequency选择数据源
-            frequency = getattr(self.context, 'frequency', '1d')
-            if frequency == '1m' and self.data_context.stock_data_dict_1m is not None:
-                data_source = self.data_context.stock_data_dict_1m
+            data_source = self.data_context.stock_data_dict
+
+        if stock not in data_source:
+            return None, None, frequency
+
+        stock_df = data_source[stock]
+        if not isinstance(stock_df, pd.DataFrame):
+            return None, None, frequency
+
+        try:
+            current_dt = self.context.current_dt
+            if frequency == '1m':
+                idx = stock_df.index.searchsorted(current_dt, side='right') - 1
+                if idx < 0:
+                    return stock_df, None, frequency
             else:
-                data_source = self.data_context.stock_data_dict
+                query_dt = pd.Timestamp(current_dt).normalize()
+                date_dict, _ = self.get_stock_date_index(stock)
+                idx = date_dict.get(query_dt.value)
+                if idx is None:
+                    idx = stock_df.index.get_loc(query_dt)
+            return stock_df, idx, frequency
+        except Exception:
+            return stock_df, None, frequency
 
-            if stock not in data_source:
-                self.log.warning("get_execution_price 失败 | %s 不在数据源中", stock)
-                return None
+    def get_bar_volume_limit(self, stock: str) -> int:
+        """返回当前 bar 可成交的最大数量。"""
+        stock_df, idx, frequency = self._get_bar_context(stock)
+        if stock_df is None or idx is None:
+            return 0
 
-            stock_df = data_source[stock]
-            if not isinstance(stock_df, pd.DataFrame):
+        if config.trading.limit_mode == 'UNLIMITED':
+            return int(1e18)
+
+        if frequency == '1m':
+            reference_volume = float(stock_df['volume'].values[idx])
+        else:
+            ref_idx = idx - 1 if idx > 0 else idx
+            reference_volume = float(stock_df['volume'].values[ref_idx])
+
+        if reference_volume <= 0:
+            return 0
+        return int(reference_volume * config.trading.volume_ratio)
+
+    def apply_volume_limit(self, stock: str, amount: int) -> int:
+        """按配置限制单笔成交量。"""
+        if amount == 0 or config.trading.limit_mode == 'UNLIMITED':
+            return amount
+
+        limit_amount = self.get_bar_volume_limit(stock)
+        if limit_amount <= 0:
+            return 0
+
+        sign = 1 if amount > 0 else -1
+        adjusted = min(abs(int(amount)), limit_amount)
+        if adjusted >= 100:
+            adjusted = (adjusted // 100) * 100
+        if adjusted <= 0:
+            return 0
+        if adjusted < abs(int(amount)):
+            self.log.info("成交量限制生效 %s | 数量 %s -> %s", stock, abs(int(amount)), adjusted)
+        return sign * adjusted
+
+    def get_execution_price(self, stock: str, limit_price: Optional[float] = None, is_buy: bool = True) -> Optional[float]:
+        """获取交易执行价格（含滑点）。"""
+        if limit_price is not None:
+            base_price = float(limit_price)
+        else:
+            stock_df, idx, frequency = self._get_bar_context(stock)
+            if stock_df is None or idx is None:
+                self.log.warning("get_execution_price 失败 | %s 无法定位当前bar", stock)
                 return None
 
             try:
-                current_dt = self.context.current_dt
-                if frequency == '1m':
-                    # 分钟数据：用 DatetimeIndex.searchsorted 避免 datetime64[us] vs ns 精度不匹配
-                    idx = stock_df.index.searchsorted(current_dt, side='right') - 1
-                    if idx < 0:
-                        return None
-                else:
-                    # 日线数据：使用date_dict查找
-                    date_dict, _ = self.get_stock_date_index(stock)
-                    idx = date_dict.get(current_dt.value)
-                    if idx is None:
-                        idx = stock_df.index.get_loc(current_dt)
-
-                # 成交量检查：volume=0 表示停牌，Ptrade会拒绝订单
                 volume = stock_df['volume'].values[idx]
                 if volume == 0:
-                    self.log.warning("订单撤销:  当前bar交易量不足  %s  bar.volume 0.0", stock)
+                    self.log.warning("订单撤销: 当前bar交易量不足 %s", stock)
                     return None
 
-                price = stock_df['close'].values[idx]
+                price_col = 'close' if frequency == '1m' else 'open'
+                price = stock_df[price_col].values[idx]
                 base_price = float(price)
-
                 if pd.isna(base_price) or base_price <= 0:
                     self.log.warning("get_execution_price 失败 | %s 价格异常: %s", stock, base_price)
                     return None
@@ -105,37 +141,28 @@ class OrderProcessor:
                 self.log.warning("get_execution_price 异常 | %s: %s", stock, e)
                 return None
 
-        # 获取滑点配置
         slippage = config.trading.slippage
         fixed_slippage = config.trading.fixed_slippage
-
-        # 计算滑点金额
         if slippage > 0:
-            # 比例滑点：滑点金额 = 委托价格 * slippage / 2
             slippage_amount = base_price * slippage / 2
         elif fixed_slippage > 0:
-            # 固定滑点：滑点金额 = fixed_slippage / 2（单位：元）
             slippage_amount = fixed_slippage / 2
         else:
-            # 无滑点
             slippage_amount = 0
 
-        # 最终成交价格 = 委托价格 ± 滑点金额
-        if is_buy:
-            # 买入向上滑点
-            final_price = base_price + slippage_amount
-        else:
-            # 卖出向下滑点
-            final_price = base_price - slippage_amount
-
+        final_price = base_price + slippage_amount if is_buy else base_price - slippage_amount
         return final_price
 
     def check_limit_status(self, stock: str, delta: int, limit_status: int) -> bool:
-        """检查涨跌停限制
-
-        Ptrade回测不阻止涨跌停交易，只靠volume=0（停牌）拒绝订单。
-        保留接口以兼容调用方。
-        """
+        """检查涨跌停限制。"""
+        if config.trading.limit_mode == 'UNLIMITED':
+            return True
+        if limit_status > 0 and delta > 0:
+            self.log.warning("订单失败 %s | 原因: 一字涨停无法买入", stock)
+            return False
+        if limit_status < 0 and delta < 0:
+            self.log.warning("订单失败 %s | 原因: 一字跌停无法卖出", stock)
+            return False
         return True
 
     def create_order(self, stock: str, amount: int, price: float) -> tuple[str, object]:
@@ -202,10 +229,11 @@ class OrderProcessor:
         commission = self.calculate_commission(amount, price, is_sell=False)
         total_cost = cost + commission
 
-        if total_cost > self.context.portfolio._cash:
+        available_cash = self.context.portfolio.available_cash
+        if total_cost > available_cash:
             daily_commission = getattr(self.context, '_daily_buy_commission', 0.0)
-            if cost > self.context.portfolio._cash + daily_commission:
-                self.log.warning(f"【买入失败】{stock} | 原因: 现金不足 (需要{total_cost:.2f}, 可用{self.context.portfolio._cash:.2f})")
+            if cost > available_cash + daily_commission:
+                self.log.warning(f"【买入失败】{stock} | 原因: 可用资金不足 (需要{total_cost:.2f}, 可用{available_cash:.2f})")
                 return False
 
         self.context.portfolio._cash -= total_cost

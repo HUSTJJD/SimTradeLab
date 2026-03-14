@@ -67,6 +67,11 @@ class BacktestConfig(BaseModel):
     margincash_margin_rate: float = Field(default=1.5, gt=0.0, description="融资保证金比例")
     marginsec_interest_rate: float = Field(default=0.10, ge=0.0, description="融券年化利率")
     marginsec_margin_rate: float = Field(default=1.5, gt=0.0, description="融券保证金比例")
+    margin_call_rate: float = Field(default=1.3, gt=1.0, description="维持担保比例追保线")
+    margin_liquidation_rate: float = Field(default=1.1, gt=1.0, description="维持担保比例强平线")
+    margincash_stocks: Optional[list[str]] = Field(default=None, description="允许融资买入的标的列表，为空表示不限制")
+    marginsec_stocks: Optional[list[str]] = Field(default=None, description="允许融券卖出的标的列表，为空表示不限制")
+    assure_stocks: Optional[list[str]] = Field(default=None, description="允许作为担保品的标的列表，为空表示不限制")
 
     model_config = {"arbitrary_types_allowed": True}
 

@@ -300,7 +300,7 @@ class StrategyExecutionEngine:
             # 清理全局缓存
             cache_manager.clear_daily_cache(current_date)
 
-            # 收集交易前统计
+            # 收集交易日前置统计（日期轴）
             self.stats_collector.collect_pre_trading(self.context, current_date)
 
             # T+1日切：前日持仓全部可卖（在除权事件前重置，送股后由除权处理自行更新）
@@ -309,6 +309,9 @@ class StrategyExecutionEngine:
 
             # 处理除权除息事件（在策略执行前）
             self._process_dividend_events(current_date)
+
+            # 若上一交易日已跌破强平线，则在当日开盘执行强平
+            self._process_pending_margin_liquidation(current_date)
 
             # 构造data对象
             data = Data(current_date, self.context.portfolio._bt_ctx)
@@ -322,6 +325,7 @@ class StrategyExecutionEngine:
 
             # 日终计提融资融券利息
             self.context.portfolio.accrue_margin_interest(current_date)
+            self.context.portfolio.refresh_margin_risk_flags()
 
             # 收集交易金额（从OrderProcessor累计的gross金额）
             self.stats_collector.collect_trading_amounts(self.context)
@@ -376,7 +380,7 @@ class StrategyExecutionEngine:
             # 清理全局缓存
             cache_manager.clear_daily_cache(current_date)
 
-            # 收集交易前统计
+            # 收集交易日前置统计（日期轴）
             self.stats_collector.collect_pre_trading(self.context, current_date)
 
             # T+1日切：前日持仓全部可卖
@@ -385,6 +389,9 @@ class StrategyExecutionEngine:
 
             # 处理除权除息事件（在策略执行前）
             self._process_dividend_events(current_date)
+
+            # 若上一交易日已跌破强平线，则在当日开盘执行强平
+            self._process_pending_margin_liquidation(current_date.replace(hour=9, minute=30, second=0))
 
             # 构造data对象
             data = Data(current_date, self.context.portfolio._bt_ctx)
@@ -414,6 +421,7 @@ class StrategyExecutionEngine:
 
             # 日终计提融资融券利息
             self.context.portfolio.accrue_margin_interest(self.context.current_dt)
+            self.context.portfolio.refresh_margin_risk_flags()
 
             # 收集交易金额（从OrderProcessor累计的gross金额）
             self.stats_collector.collect_trading_amounts(self.context)
@@ -475,6 +483,104 @@ class StrategyExecutionEngine:
                 except Exception as e:
                     self.log.error(f"run_daily任务({hhmm})执行失败: {e}")
                     self.log.error(traceback.format_exc())
+
+    def _process_pending_margin_liquidation(self, trade_dt) -> None:
+        """在下一交易日开盘执行待处理的强平。"""
+        portfolio = self.context.portfolio
+        if not portfolio.margin_enabled or not portfolio.margin_liquidation_pending:
+            return
+
+        original_dt = self.context.current_dt
+        original_blotter_dt = self.context.blotter.current_dt
+        try:
+            self.context.current_dt = trade_dt
+            self.context.blotter.current_dt = trade_dt
+            self.log.warning('维持担保比例跌破强平线，开始执行开盘强平: %s', trade_dt)
+            self._force_liquidate_margin_account()
+        finally:
+            self.context.current_dt = original_dt
+            self.context.blotter.current_dt = original_blotter_dt
+
+    def _force_liquidate_margin_account(self) -> None:
+        """执行全账户强平，优先卖出多头并归还融资，再回补融券。"""
+        portfolio = self.context.portfolio
+
+        # 1) 先卖出全部多头持仓，优先偿还对应的融资负债
+        for stock in list(portfolio.positions.keys()):
+            position = portfolio.positions.get(stock)
+            if position is None or position.amount <= 0:
+                continue
+            amount = int(position.amount)
+            price = self.api.order_processor.get_execution_price(stock, None, False)
+            if price is None:
+                self.log.warning('强平卖出跳过 %s | 原因: 无法获取价格', stock)
+                continue
+
+            revenue = amount * price
+            commission = self.api.order_processor.calculate_commission(amount, price, is_sell=True)
+            tax_adjustment = portfolio.remove_position(stock, amount, self.context.current_dt)
+            interest_repaid = 0.0
+            principal_repaid = 0.0
+            if stock in portfolio.margin_cash_positions:
+                interest_repaid = portfolio.repay_margin_interest(revenue)
+                principal_repaid = portfolio.repay_margin_cash(stock, amount, revenue - interest_repaid)
+            cash_delta = revenue - interest_repaid - principal_repaid - commission - tax_adjustment
+            portfolio._cash += cash_delta
+            self.context._daily_sell_total += revenue
+            self.context.total_commission = getattr(self.context, 'total_commission', 0.0) + commission
+            self.log.warning(
+                '强平卖出 %s | %s 股 | 价格 %.3f | 偿还利息 %.2f | 偿还本金 %.2f',
+                stock, amount, price, interest_repaid, principal_repaid
+            )
+
+        # 2) 再按现金能力回补融券负债
+        for stock in list(portfolio.margin_short_positions.keys()):
+            short_item = portfolio.margin_short_positions.get(stock)
+            if short_item is None:
+                continue
+            amount = int(short_item.get('amount', 0) or 0)
+            if amount <= 0:
+                continue
+
+            price = self.api.order_processor.get_execution_price(stock, None, True)
+            if price is None:
+                self.log.warning('强平买券还券跳过 %s | 原因: 无法获取价格', stock)
+                continue
+
+            commission = self.api.order_processor.calculate_commission(amount, price, is_sell=False)
+            total_cost = amount * price + commission
+            if total_cost > portfolio.cash + 1e-8:
+                affordable = int(portfolio.cash / price / 100) * 100 if price > 0 else 0
+                while affordable >= 100:
+                    test_commission = self.api.order_processor.calculate_commission(affordable, price, is_sell=False)
+                    if affordable * price + test_commission <= portfolio.cash + 1e-8:
+                        break
+                    affordable -= 100
+                amount = affordable
+                if amount <= 0:
+                    self.log.warning('强平买券还券跳过 %s | 原因: 现金不足', stock)
+                    continue
+                commission = self.api.order_processor.calculate_commission(amount, price, is_sell=False)
+                total_cost = amount * price + commission
+
+            portfolio._cash -= total_cost
+            portfolio.reduce_margin_short(stock, amount)
+            self.context._daily_buy_total += amount * price
+            self.context._daily_buy_commission = getattr(self.context, '_daily_buy_commission', 0.0) + commission
+            self.context.total_commission = getattr(self.context, 'total_commission', 0.0) + commission
+            self.log.warning('强平买券还券 %s | %s 股 | 价格 %.3f', stock, amount, price)
+
+        # 3) 使用剩余现金继续归还融资利息和本金
+        if portfolio.cash > 0:
+            interest_actual = portfolio.repay_margin_interest(portfolio.cash)
+            principal_actual = portfolio.repay_margin_cash_with_value(portfolio.cash - interest_actual)
+            actual = interest_actual + principal_actual
+            portfolio._cash -= actual
+            if actual > 0:
+                self.log.warning('强平后继续归还融资负债 | 利息 %.2f | 本金 %.2f', interest_actual, principal_actual)
+
+        portfolio.clear_margin_liquidation_flag()
+        portfolio.refresh_margin_risk_flags()
 
     def _execute_lifecycle(self, data) -> bool:
         """执行策略生命周期方法
@@ -542,56 +648,93 @@ class StrategyExecutionEngine:
             return allow_fail
 
     def _process_dividend_events(self, current_date):
-        """处理除权除息事件
-
-        Args:
-            current_date: 当前交易日
+        """处理除权除息事件。
 
         处理逻辑：
-        1. 送股/配股: 调整持仓数量
-        2. 现金分红: 到账（预扣税20%）
+        1. 多头：现金分红、送股/转增、配股摊薄与现金扣款
+        2. 融券空头：红利补偿、送转后需归还证券数量调整
         """
         try:
+            portfolio = self.context.portfolio
             date_str = current_date.strftime('%Y%m%d')
+            date_int = int(date_str)
+            long_positions = list(portfolio.positions.items())
+            short_positions = list(portfolio.margin_short_positions.items())
 
-            for stock_code, position in self.context.portfolio.positions.items():
+            for stock_code, position in long_positions:
                 if position.amount <= 0:
                     continue
 
-                # 分红和送股都基于登记日（前一天）的持股数
-                original_amount = position.amount
-
-                # 检查除权事件（送股/配股）
+                original_amount = int(position.amount)
                 exrights_df = self.api.data_context.exrights_dict.get(stock_code)
-                if exrights_df is not None and not exrights_df.empty:
-                    date_int = int(date_str)
-                    if date_int in exrights_df.index:
-                        event = exrights_df.loc[date_int]
-                        allotted = float(event.get('allotted_ps', 0) or 0)
-                        if allotted > 0:
-                            new_amount = int(original_amount * (1 + allotted))
-                            position.amount = new_amount
-                            position.enable_amount = new_amount
-                            position.cost_basis /= (1 + allotted)
-                            self.context.portfolio._invalidate_cache()
+                event = None
+                if exrights_df is not None and not exrights_df.empty and date_int in exrights_df.index:
+                    event = exrights_df.loc[date_int]
 
-                # 现金分红（按登记日股数计算）
-                if stock_code not in self.api.data_context.dividend_cache:
+                allotted = float(event.get('allotted_ps', 0) or 0) if event is not None else 0.0
+                rationed = float(event.get('rationed_ps', 0) or 0) if event is not None else 0.0
+                rationed_px = float(event.get('rationed_px', 0) or 0) if event is not None else 0.0
+                dividend_per_share_before_tax = float(event.get('bonus_ps', 0) or 0) if event is not None else 0.0
+
+                if dividend_per_share_before_tax <= 0 and stock_code in self.api.data_context.dividend_cache:
+                    stock_dividends = self.api.data_context.dividend_cache[stock_code]
+                    if date_str in stock_dividends:
+                        dividend_per_share_before_tax = float(stock_dividends[date_str] or 0.0)
+
+                share_multiplier = 1.0 + allotted + rationed
+                if share_multiplier > 1.0:
+                    new_amount = int(round(original_amount * share_multiplier))
+                    adjusted_cost = position.cost_basis
+                    if share_multiplier > 0:
+                        adjusted_cost = (position.cost_basis - dividend_per_share_before_tax + rationed * rationed_px) / share_multiplier
+                    position.amount = new_amount
+                    position.enable_amount = new_amount
+                    position.cost_basis = max(adjusted_cost, 0.0)
+                    position.market_value = new_amount * position.cost_basis
+                    if stock_code in portfolio._position_lots:
+                        for lot in portfolio._position_lots[stock_code]:
+                            lot['amount'] = int(round(lot['amount'] * share_multiplier))
+                    if rationed > 0 and rationed_px > 0:
+                        portfolio._cash -= original_amount * rationed * rationed_px
+                    portfolio._invalidate_cache()
+
+                if dividend_per_share_before_tax > 0:
+                    pre_tax_rate = 0.20
+                    total_dividend_after_tax = dividend_per_share_before_tax * (1 - pre_tax_rate) * original_amount
+                    if total_dividend_after_tax > 0:
+                        portfolio._cash += total_dividend_after_tax
+                        portfolio._invalidate_cache()
+                        portfolio.add_dividend(stock_code, dividend_per_share_before_tax)
+
+            for stock_code, item in short_positions:
+                original_amount = int(item.get('amount', 0) or 0)
+                if original_amount <= 0:
                     continue
 
-                stock_dividends = self.api.data_context.dividend_cache[stock_code]
-                if date_str not in stock_dividends:
+                exrights_df = self.api.data_context.exrights_dict.get(stock_code)
+                if exrights_df is None or exrights_df.empty or date_int not in exrights_df.index:
                     continue
 
-                dividend_per_share_before_tax = stock_dividends[date_str]
-                pre_tax_rate = 0.20
-                dividend_per_share_after_tax = dividend_per_share_before_tax * (1 - pre_tax_rate)
-                total_dividend_after_tax = dividend_per_share_after_tax * original_amount
+                event = exrights_df.loc[date_int]
+                allotted = float(event.get('allotted_ps', 0) or 0)
+                rationed = float(event.get('rationed_ps', 0) or 0)
+                rationed_px = float(event.get('rationed_px', 0) or 0)
+                dividend_per_share_before_tax = float(event.get('bonus_ps', 0) or 0)
+                share_multiplier = 1.0 + allotted + rationed
 
-                if total_dividend_after_tax > 0:
-                    self.context.portfolio._cash += total_dividend_after_tax
-                    self.context.portfolio._invalidate_cache()
-                    self.context.portfolio.add_dividend(stock_code, dividend_per_share_before_tax)
+                if share_multiplier > 1.0:
+                    new_amount = int(round(original_amount * share_multiplier))
+                    adjusted_open_price = float(item.get('open_price', 0.0) or 0.0)
+                    adjusted_open_price = max((adjusted_open_price - dividend_per_share_before_tax + rationed * rationed_px) / share_multiplier, 0.0)
+                    item['amount'] = new_amount
+                    item['open_price'] = adjusted_open_price
+
+                if dividend_per_share_before_tax > 0:
+                    compensation = dividend_per_share_before_tax * original_amount
+                    item['dividend_compensation_paid'] = round(float(item.get('dividend_compensation_paid', 0.0) or 0.0) + compensation, 2)
+                    portfolio._cash -= compensation
+
+                portfolio._invalidate_cache()
 
         except Exception as e:
             self.log.warning(f"除权除息处理失败: {e}")

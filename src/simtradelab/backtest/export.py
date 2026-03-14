@@ -59,18 +59,24 @@ def _export_daily_stats(stats: BacktestStats, output_dir: str, suffix: str) -> s
     def _pad(lst):
         if len(lst) < n:
             return list(lst) + [0] * (n - len(lst))
-        return lst
+        return list(lst[:n])
 
     df = pd.DataFrame({
         'date': dates,
-        'portfolio_value': stats.portfolio_values[:n],
+        'portfolio_value': _pad(stats.portfolio_values),
         'daily_pnl': _pad(stats.daily_pnl),
         'buy_amount': _pad(stats.daily_buy_amount),
         'sell_amount': _pad(stats.daily_sell_amount),
         'positions_value': _pad(stats.daily_positions_value),
+        'available_cash': _pad(getattr(stats, 'daily_available_cash', [])),
+        'assure_asset': _pad(getattr(stats, 'daily_assure_asset', [])),
+        'net_asset': _pad(getattr(stats, 'daily_net_asset', [])),
         'cash_liability': _pad(getattr(stats, 'daily_cash_liability', [])),
         'sec_liability': _pad(getattr(stats, 'daily_sec_liability', [])),
+        'total_debit': _pad(getattr(stats, 'daily_total_debit', [])),
         'margin_interest': _pad(getattr(stats, 'daily_margin_interest', [])),
+        'enable_bail_balance': _pad(getattr(stats, 'daily_enable_bail_balance', [])),
+        'maintenance_margin_rate': _pad(getattr(stats, 'daily_maintenance_margin_rate', [])),
     })
     path = os.path.join(output_dir, f"daily_stats_{suffix}.csv")
     df.to_csv(path, index=False, encoding='utf-8-sig')
@@ -90,8 +96,13 @@ def _export_positions(stats: BacktestStats, output_dir: str, suffix: str) -> str
                 'market_value': pos['v'],
                 'cost_basis': pos['b'],
                 'business_type': pos.get('bt', 'STOCK'),
+                'debt_balance': pos.get('debt_balance', 0.0),
+                'open_dt': pos.get('open_dt'),
             })
-    df = pd.DataFrame(rows, columns=['date', 'stock_code', 'name', 'amount', 'market_value', 'cost_basis', 'business_type'])
+    df = pd.DataFrame(
+        rows,
+        columns=['date', 'stock_code', 'name', 'amount', 'market_value', 'cost_basis', 'business_type', 'debt_balance', 'open_dt'],
+    )
     path = os.path.join(output_dir, f"positions_history_{suffix}.csv")
     df.to_csv(path, index=False, encoding='utf-8-sig')
     return path

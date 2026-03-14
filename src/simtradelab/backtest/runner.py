@@ -284,13 +284,20 @@ class BacktestRunner:
                 margincash_margin_rate=config.margincash_margin_rate,
                 marginsec_interest_rate=config.marginsec_interest_rate,
                 marginsec_margin_rate=config.marginsec_margin_rate,
+                margin_call_rate=config.margin_call_rate,
+                liquidation_rate=config.margin_liquidation_rate,
+                margincash_stocks=config.margincash_stocks,
+                marginsec_stocks=config.marginsec_stocks,
+                assure_stocks=config.assure_stocks,
             )
             log.info(
-                '启用融资融券账户: 融资利率=%.4f 融资保证金=%.2f 融券利率=%.4f 融券保证金=%.2f',
+                '启用融资融券账户: 融资利率=%.4f 融资保证金=%.2f 融券利率=%.4f 融券保证金=%.2f 追保线=%.2f 强平线=%.2f',
                 config.margincash_interest_rate,
                 config.margincash_margin_rate,
                 config.marginsec_interest_rate,
                 config.marginsec_margin_rate,
+                config.margin_call_rate,
+                config.margin_liquidation_rate,
             )
 
         # 创建数据上下文

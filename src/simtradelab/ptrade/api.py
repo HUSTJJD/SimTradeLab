@@ -19,6 +19,7 @@ import pandas as pd
 import json
 import bisect
 import calendar
+import os
 import traceback
 
 from collections import OrderedDict
@@ -183,6 +184,55 @@ class PtradeAPI:
             else:
                 self._stock_date_index[stock] = ({}, np.array([], dtype='i8'))
         return self._stock_date_index[stock]
+
+    def _get_current_phase(self):
+        """获取当前生命周期阶段。"""
+        controller = self.context._lifecycle_controller if self.context else None
+        return controller.current_phase if controller else None
+
+    def _should_use_previous_daily_bar(self) -> bool:
+        """日线策略在盘前和 handle_data 阶段只能看到前一交易日数据。"""
+        from .lifecycle_controller import LifecyclePhase
+
+        frequency = getattr(self.context, 'frequency', '1d') if self.context else '1d'
+        phase = self._get_current_phase()
+        return frequency != '1m' and phase in (LifecyclePhase.BEFORE_TRADING_START, LifecyclePhase.HANDLE_DATA)
+
+    def _resolve_default_query_timestamp(self, explicit_date=None, frequency: str = '1d') -> pd.Timestamp:
+        """根据生命周期解析默认查询时间，避免日线未来函数。"""
+        if explicit_date is not None:
+            ts = pd.Timestamp(explicit_date)
+            return ts if frequency == '1m' else ts.normalize()
+
+        current_dt = self.context.current_dt if self.context else pd.Timestamp.now()
+        if frequency == '1m':
+            return pd.Timestamp(current_dt)
+
+        query_ts = pd.Timestamp(current_dt).normalize()
+        if self._should_use_previous_daily_bar():
+            prev_trade_day = self.get_trading_day(-1)
+            if prev_trade_day is not None:
+                query_ts = pd.Timestamp(prev_trade_day)
+        return query_ts
+
+    def _get_margin_stock_pool(self, config_key: str) -> list[str]:
+        """获取两融/担保品标的池。"""
+        explicit_list = self.context.portfolio.margin_config.get(config_key) if self.context else None
+        if explicit_list:
+            return sorted(set(explicit_list))
+        return sorted(self.data_context.stock_data_dict.keys())
+
+    def _ensure_margin_security_allowed(self, security: str, config_key: str, label: str) -> bool:
+        """检查证券是否在指定两融标的池内。"""
+        allowed = self._get_margin_stock_pool(config_key)
+        if security in allowed:
+            return True
+        self.log.warning('%s失败 %s | 原因: 不在允许的%s标的池', label, security, label)
+        return False
+
+    def _apply_volume_limit(self, security: str, amount: int) -> int:
+        """按成交量限制调整委托数量。"""
+        return self.order_processor.apply_volume_limit(security, amount)
 
     def _apply_adj_factors(self, stock_df: pd.DataFrame, stock: str, fq: str) -> pd.DataFrame:
         """对DataFrame应用复权因子（向量化）
@@ -392,11 +442,8 @@ class PtradeAPI:
 
             data_dict = self.data_context.fundamentals_dict
 
-        # 如果未指定date，使用回测当前日期
-        if date is None:
-            query_ts = self.context.current_dt
-        else:
-            query_ts = pd.Timestamp(date)
+        # 如果未指定date，使用与当前生命周期一致的有效查询日期
+        query_ts = self._resolve_default_query_timestamp(date)
         cache_key = (table, query_ts)
 
         # 获取或创建日期索引缓存（LRUCache 自动淘汰）
@@ -575,7 +622,7 @@ class PtradeAPI:
         data_source = self._get_data_source(frequency)
 
         if count is not None:
-            end_dt = pd.Timestamp(end_date) if end_date else self.context.current_dt
+            end_dt = self._resolve_default_query_timestamp(end_date, frequency=frequency)
             result = {}
             for stock in stocks:
                 if stock not in data_source:
@@ -607,7 +654,7 @@ class PtradeAPI:
                 result[stock] = slice_df
         else:
             start_dt = pd.Timestamp(start_date) if start_date else None
-            end_dt = pd.Timestamp(end_date) if end_date else self.context.current_dt
+            end_dt = self._resolve_default_query_timestamp(end_date, frequency=frequency)
 
             result = {}
             for stock in stocks:
@@ -678,7 +725,7 @@ class PtradeAPI:
             return {} if is_dict else pd.DataFrame()
 
         current_dt = self.context.current_dt
-        lookup_dt = current_dt if frequency == '1m' else pd.Timestamp(current_dt).normalize()
+        lookup_dt = self._resolve_default_query_timestamp(None, frequency=frequency)
 
         # 缓存键：frozenset 归一化顺序 O(n)，比 tuple(sorted()) O(n log n) 更快
         field_key = tuple(fields) if len(fields) > 1 else fields[0]
@@ -1159,7 +1206,7 @@ class PtradeAPI:
                     若连 1 手以前日价也买不起则直接失败，不再尝试调整。
                     后续调整计算仍用 price（今日收盘价）。
         """
-        available_cash = self.context.portfolio._cash
+        available_cash = self.context.portfolio.available_cash
         min_lot = 100
 
         # Ptrade 前置检查：以前日收盘价评估是否能负担最小1手
@@ -1214,6 +1261,12 @@ class PtradeAPI:
 
     def _submit_order(self, security: str, amount: int, price: float) -> Optional[str]:
         """创建订单→注册blotter→执行→更新状态。返回 order_id 或 None。"""
+        adjusted_amount = self._apply_volume_limit(security, amount)
+        if adjusted_amount == 0:
+            self.log.warning(f"订单失败 {security} | 原因: 超出当前bar可成交数量限制")
+            return None
+        amount = adjusted_amount
+
         order_id, order = self.order_processor.create_order(security, amount, price)
         if self.context and self.context.blotter:
             self.context.blotter.all_orders.append(order)
@@ -1315,7 +1368,7 @@ class PtradeAPI:
         if is_buy:
             target_amount = int(value / price / min_lot) * min_lot
             if target_amount < min_lot:
-                self.log.warning(f"【下单失败】{security} | 原因: 分配金额不足{min_lot}股 (分配{value:.2f}元, 价格{price:.2f}元, 可用现金{self.context.portfolio._cash:.2f}元)")
+                self.log.warning(f"【下单失败】{security} | 原因: 分配金额不足{min_lot}股 (分配{value:.2f}元, 价格{price:.2f}元, 可用资金{self.context.portfolio.available_cash:.2f}元)")
                 return None
             # 科创板买入最小申报数量 200 股
             if security.startswith('688') and target_amount < 200:
@@ -1480,15 +1533,21 @@ class PtradeAPI:
             raise RuntimeError('当前上下文不可用，无法执行融资融券操作')
         self.context.portfolio.ensure_margin_enabled()
 
-    def _normalize_margin_amount(self, amount: int, available: int = 0) -> int:
+    def _normalize_margin_amount(self, amount: int, available: int = None) -> int:
         """按 A 股整手规则调整两融数量。"""
         amount = int(amount)
         if amount <= 0:
             return 0
-        if available > 0 and amount >= available:
-            return int(available)
+
+        if available is not None:
+            available = int(available)
+            if available <= 0:
+                return 0
+            if amount >= available:
+                return available
+
         normalized = (amount // 100) * 100
-        if normalized <= 0 and 0 < available < 100:
+        if normalized <= 0 and available is not None and 0 < available < 100:
             return int(available)
         return normalized
 
@@ -1515,13 +1574,16 @@ class PtradeAPI:
         """融资买入。"""
         _ = market_type
         self._ensure_margin_account_enabled()
+        if not self._ensure_margin_security_allowed(security, 'margincash_stocks', '融资买入'):
+            return None
         price = self._get_price_and_check_limit(security, limit_price, abs(amount))
         if price is None:
             return None
 
         amount = self._normalize_margin_amount(amount)
+        amount = self._apply_volume_limit(security, amount)
         if amount <= 0:
-            self.log.warning('融资买入失败 %s | 原因: 数量不足一手', security)
+            self.log.warning('融资买入失败 %s | 原因: 数量不足一手或超过当前bar成交限制', security)
             return None
 
         max_value = self.context.portfolio.get_margin_capacity('cash')
@@ -1546,6 +1608,7 @@ class PtradeAPI:
         if position is not None:
             position.business_type = 'MARGIN_CASH'
         self.context.portfolio.record_margin_cash_open(security, amount, price, self.context.current_dt)
+        self.context.portfolio.refresh_margin_risk_flags()
         self.context._daily_buy_total += trade_value
         self.context._daily_buy_commission = getattr(self.context, '_daily_buy_commission', 0.0) + commission
         if not hasattr(self.context, 'total_commission'):
@@ -1568,8 +1631,10 @@ class PtradeAPI:
         if self.context.t_plus_1:
             available = min(available, int(position.enable_amount))
         amount = self._normalize_margin_amount(amount, available=available)
+        amount = self._apply_volume_limit(security, -amount)
+        amount = abs(amount)
         if amount <= 0:
-            self.log.warning('卖券还款失败 %s | 原因: 可卖数量不足', security)
+            self.log.warning('卖券还款失败 %s | 原因: 可卖数量不足或超过当前bar成交限制', security)
             return None
 
         price = self._get_price_and_check_limit(security, limit_price, -amount)
@@ -1579,40 +1644,49 @@ class PtradeAPI:
         revenue = amount * price
         commission = self.order_processor.calculate_commission(amount, price, is_sell=True)
         tax_adjustment = self.context.portfolio.remove_position(security, amount, self.context.current_dt)
-        repaid = self.context.portfolio.repay_margin_cash(security, amount, revenue)
-        cash_delta = revenue - repaid - commission - tax_adjustment
+        interest_repaid = self.context.portfolio.repay_margin_interest(revenue)
+        repaid = self.context.portfolio.repay_margin_cash(security, amount, revenue - interest_repaid)
+        cash_delta = revenue - interest_repaid - repaid - commission - tax_adjustment
         self.context.portfolio._cash += cash_delta
+        self.context.portfolio.refresh_margin_risk_flags()
         self.context._daily_sell_total += revenue
         if not hasattr(self.context, 'total_commission'):
             self.context.total_commission = 0
         self.context.total_commission += commission
-        self.log.info('卖券还款成交 %s | %s 股 | 价格 %.3f | 偿还 %.2f', security, amount, price, repaid)
+        self.log.info('卖券还款成交 %s | %s 股 | 价格 %.3f | 偿还利息 %.2f | 偿还本金 %.2f', security, amount, price, interest_repaid, repaid)
         return self._finalize_margin_order(security, -amount, price, 'MARGIN_CASH_CLOSE')
 
     @validate_lifecycle
     def margincash_direct_refund(self, value: float) -> None:
         """直接还款。"""
         self._ensure_margin_account_enabled()
-        repay_value = min(float(value), self.context.portfolio.cash, self.context.portfolio.cash_liability)
+        max_repayable = self.context.portfolio.margin_interest + self.context.portfolio.cash_liability
+        repay_value = min(float(value), self.context.portfolio.cash, max_repayable)
         if repay_value <= 0:
-            self.log.info('直接还款跳过 | 当前无可归还融资负债或现金不足')
+            self.log.info('直接还款跳过 | 当前无可归还融资负债/利息或现金不足')
             return
-        actual = self.context.portfolio.repay_margin_cash_with_value(repay_value)
+        interest_actual = self.context.portfolio.repay_margin_interest(repay_value)
+        principal_actual = self.context.portfolio.repay_margin_cash_with_value(repay_value - interest_actual)
+        actual = interest_actual + principal_actual
         self.context.portfolio._cash -= actual
-        self.log.info('直接还款完成 | 金额 %.2f', actual)
+        self.context.portfolio.refresh_margin_risk_flags()
+        self.log.info('直接还款完成 | 偿还利息 %.2f | 偿还本金 %.2f', interest_actual, principal_actual)
 
     @validate_lifecycle
     def marginsec_open(self, security: str, amount: int, limit_price: float = None, market_type: int = None) -> Optional[str]:
         """融券卖出。"""
         _ = market_type
         self._ensure_margin_account_enabled()
+        if not self._ensure_margin_security_allowed(security, 'marginsec_stocks', '融券卖出'):
+            return None
         price = self._get_price_and_check_limit(security, limit_price, -abs(amount))
         if price is None:
             return None
 
         amount = self._normalize_margin_amount(amount)
+        amount = abs(self._apply_volume_limit(security, -amount))
         if amount <= 0:
-            self.log.warning('融券卖出失败 %s | 原因: 数量不足一手', security)
+            self.log.warning('融券卖出失败 %s | 原因: 数量不足一手或超过当前bar成交限制', security)
             return None
 
         max_value = self.context.portfolio.get_margin_capacity('sec')
@@ -1629,6 +1703,7 @@ class PtradeAPI:
         commission = self.order_processor.calculate_commission(amount, price, is_sell=True)
         self.context.portfolio._cash += trade_value - commission
         self.context.portfolio.record_margin_short_open(security, amount, price, self.context.current_dt)
+        self.context.portfolio.refresh_margin_risk_flags()
         self.context._daily_sell_total += trade_value
         if not hasattr(self.context, 'total_commission'):
             self.context.total_commission = 0
@@ -1647,8 +1722,9 @@ class PtradeAPI:
 
         available = int(short_item.get('amount', 0) or 0)
         amount = self._normalize_margin_amount(amount, available=available)
+        amount = self._apply_volume_limit(security, amount)
         if amount <= 0:
-            self.log.warning('买券还券失败 %s | 原因: 可平数量不足', security)
+            self.log.warning('买券还券失败 %s | 原因: 可平数量不足或超过当前bar成交限制', security)
             return None
 
         price = self._get_price_and_check_limit(security, limit_price, amount)
@@ -1664,6 +1740,7 @@ class PtradeAPI:
 
         self.context.portfolio._cash -= total_cost
         self.context.portfolio.reduce_margin_short(security, amount)
+        self.context.portfolio.refresh_margin_risk_flags()
         self.context._daily_buy_total += trade_value
         self.context._daily_buy_commission = getattr(self.context, '_daily_buy_commission', 0.0) + commission
         if not hasattr(self.context, 'total_commission'):
@@ -1683,26 +1760,29 @@ class PtradeAPI:
             return
 
         available = min(int(short_item.get('amount', 0) or 0), int(position.amount))
+        if self.context.t_plus_1:
+            available = min(available, int(position.enable_amount))
         amount = self._normalize_margin_amount(amount, available=available)
         if amount <= 0:
-            self.log.info('直接还券跳过 %s | 数量不足', security)
+            self.log.info('直接还券跳过 %s | 数量不足或 T+1 不可用', security)
             return
 
         self.context.portfolio.remove_position(security, amount, self.context.current_dt)
         self.context.portfolio.reduce_margin_short(security, amount)
+        self.context.portfolio.refresh_margin_risk_flags()
         self.log.info('直接还券完成 %s | %s 股', security, amount)
 
     def get_margincash_stocks(self) -> list[str]:
-        """获取可融资标的列表（本地回测近似返回全部可交易标的）。"""
-        return sorted(self.data_context.stock_data_dict.keys())
+        """获取可融资标的列表。"""
+        return self._get_margin_stock_pool('margincash_stocks')
 
     def get_marginsec_stocks(self) -> list[str]:
-        """获取可融券标的列表（本地回测近似返回全部可交易标的）。"""
-        return sorted(self.data_context.stock_data_dict.keys())
+        """获取可融券标的列表。"""
+        return self._get_margin_stock_pool('marginsec_stocks')
 
     def get_assure_security_list(self) -> list[str]:
         """获取可作为担保品的证券列表。"""
-        return sorted(self.data_context.stock_data_dict.keys())
+        return self._get_margin_stock_pool('assure_stocks')
 
     def get_margin_contract(self) -> pd.DataFrame:
         """查询当前未结两融合约。"""
@@ -1931,6 +2011,63 @@ class PtradeAPI:
                 'cost_basis': float(row.get('cost_basis', row.get('cost', row.get('price', 0))))
             })
         return positions
+
+    @validate_lifecycle
+    def send_qywx(self, title: str, content: str, webhook_key: str = None, webhook_url: str = None,
+                  mentioned_list: list[str] = None, use_markdown: bool = True, timeout: int = 5) -> bool:
+        """发送企业微信群机器人消息。"""
+        title = str(title or '').strip()
+        content = str(content or '').strip()
+        if not title and not content:
+            self.log.warning('企业微信推送跳过 | 原因: 标题和内容均为空')
+            return False
+
+        resolved_url = webhook_url or os.environ.get('QYWX_WEBHOOK_URL', '')
+        resolved_key = webhook_key or os.environ.get('QYWX_WEBHOOK_KEY', '')
+        if not resolved_url and resolved_key:
+            resolved_url = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={}'.format(resolved_key)
+
+        if not resolved_url:
+            self.log.info('企业微信推送跳过 | 原因: 未配置 webhook_url 或 QYWX_WEBHOOK_URL/QYWX_WEBHOOK_KEY')
+            return False
+
+        mentioned_list = mentioned_list or []
+        try:
+            import urllib.request
+
+            if use_markdown:
+                full_content = '**{}**\n\n{}'.format(title, content) if title else content
+                payload = {
+                    'msgtype': 'markdown',
+                    'markdown': {
+                        'content': full_content[:4096]
+                    }
+                }
+            else:
+                text_content = '{}\n{}'.format(title, content).strip()
+                payload = {
+                    'msgtype': 'text',
+                    'text': {
+                        'content': text_content[:2048],
+                        'mentioned_list': mentioned_list
+                    }
+                }
+
+            request = urllib.request.Request(
+                resolved_url,
+                data=json.dumps(payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            response = urllib.request.urlopen(request, timeout=max(int(timeout), 1))
+            result = json.loads(response.read().decode('utf-8'))
+            if result.get('errcode', -1) == 0:
+                self.log.info('企业微信推送成功 | 标题: %s', title)
+                return True
+            self.log.warning('企业微信推送失败 | 标题: %s | 返回: %s', title, result)
+            return False
+        except Exception as exc:
+            self.log.warning('企业微信推送异常 | 标题: %s | 异常: %s', title, exc)
+            return False
 
     def get_user_name(self) -> str:
         """获取登录终端的资金账号

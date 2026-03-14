@@ -245,17 +245,19 @@ class StockData:
                 controller = self._bt_ctx.context._lifecycle_controller if self._bt_ctx.context else None
                 current_phase = controller.current_phase if controller else None
 
-                is_before_trading = (current_phase == LifecyclePhase.BEFORE_TRADING_START)
+                frequency = getattr(self._bt_ctx.context, 'frequency', '1d') if self._bt_ctx and self._bt_ctx.context else '1d'
+                use_previous_daily_bar = (
+                    frequency != '1m' and
+                    current_phase in (LifecyclePhase.BEFORE_TRADING_START, LifecyclePhase.HANDLE_DATA)
+                )
 
-                if is_before_trading:
-                    # before_trading_start阶段：返回前一交易日数据
-                    # searchsorted(side='left') 等价于 bisect_left: 当 dt_value 在数组中时
-                    # 返回该元素位置，pos-1 得到前一交易日
+                if use_previous_daily_bar:
+                    # 日线盘前与 handle_data 阶段：统一返回前一交易日数据
                     pos = sorted_i8.searchsorted(dt_value, side='left')
                     if pos > 0:
                         self._current_idx = date_dict[sorted_i8[pos - 1]]
                 else:
-                    # handle_data阶段：返回当日数据
+                    # 分钟回测或日线盘后阶段：返回当前bar数据
                     if dt_value in date_dict:
                         self._current_idx = date_dict[dt_value]
 
@@ -500,17 +502,29 @@ class Portfolio:
             'margincash_margin_rate': 1.0,
             'marginsec_interest_rate': 0.0,
             'marginsec_margin_rate': 1.0,
+            'margin_call_rate': 1.3,
+            'liquidation_rate': 1.1,
+            'margincash_stocks': None,
+            'marginsec_stocks': None,
+            'assure_stocks': None,
         }
         self.margin_cash_positions = {}
         self.margin_short_positions = {}
         self.margin_interest = 0.0
         self.margin_last_accrual_date = None
         self.short_positions_value = 0.0
+        self.margin_call_active = False
+        self.margin_liquidation_pending = False
 
     def enable_margin_account(self, margincash_interest_rate=0.08,
                               margincash_margin_rate=1.5,
                               marginsec_interest_rate=0.10,
-                              marginsec_margin_rate=1.5):
+                              marginsec_margin_rate=1.5,
+                              margin_call_rate=1.3,
+                              liquidation_rate=1.1,
+                              margincash_stocks=None,
+                              marginsec_stocks=None,
+                              assure_stocks=None):
         """启用融资融券账户模拟。"""
         self.margin_enabled = True
         self.margin_config = {
@@ -518,6 +532,11 @@ class Portfolio:
             'margincash_margin_rate': float(margincash_margin_rate),
             'marginsec_interest_rate': float(marginsec_interest_rate),
             'marginsec_margin_rate': float(marginsec_margin_rate),
+            'margin_call_rate': float(margin_call_rate),
+            'liquidation_rate': float(liquidation_rate),
+            'margincash_stocks': sorted(set(margincash_stocks)) if margincash_stocks else None,
+            'marginsec_stocks': sorted(set(marginsec_stocks)) if marginsec_stocks else None,
+            'assure_stocks': sorted(set(assure_stocks)) if assure_stocks else None,
         }
         if self._context is not None and self.margin_last_accrual_date is None and self._context.current_dt is not None:
             self.margin_last_accrual_date = self._context.current_dt.date()
@@ -597,6 +616,16 @@ class Portfolio:
         required_collateral = self.get_margin_required_collateral()
         enable_bail_balance = max(net_asset - required_collateral, 0.0)
         maintenance_margin_rate = assure_asset / total_debit if total_debit > 0 else float('inf')
+
+        if total_debit <= 0:
+            risk_status = 'normal'
+        elif maintenance_margin_rate < self.margin_config['liquidation_rate']:
+            risk_status = 'liquidation'
+        elif maintenance_margin_rate < self.margin_config['margin_call_rate']:
+            risk_status = 'margin_call'
+        else:
+            risk_status = 'normal'
+
         return {
             'assure_asset': round(assure_asset, 2),
             'portfolio_value': round(portfolio_value, 2),
@@ -605,17 +634,59 @@ class Portfolio:
             'cash_liability': round(cash_liability, 2),
             'sec_liability': round(sec_liability, 2),
             'interest': round(self.margin_interest, 2),
+            'required_collateral': round(required_collateral, 2),
             'enable_bail_balance': round(enable_bail_balance, 2),
+            'raw_cash': round(self._cash, 2),
+            'available_cash': round(self.available_cash, 2),
+            'margin_call_rate': round(self.margin_config['margin_call_rate'], 6),
+            'liquidation_rate': round(self.margin_config['liquidation_rate'], 6),
             'maintenance_margin_rate': round(maintenance_margin_rate, 6) if np.isfinite(maintenance_margin_rate) else float('inf'),
+            'risk_status': risk_status,
+            'liquidation_pending': self.margin_liquidation_pending,
         }
+
+    def get_margin_risk_state(self):
+        """返回当前两融风险状态。"""
+        summary = self.get_margin_account_summary()
+        return {
+            'status': summary['risk_status'],
+            'maintenance_margin_rate': summary['maintenance_margin_rate'],
+            'margin_call_rate': summary['margin_call_rate'],
+            'liquidation_rate': summary['liquidation_rate'],
+            'liquidation_pending': self.margin_liquidation_pending,
+            'total_debit': summary['total_debit'],
+        }
+
+    def refresh_margin_risk_flags(self):
+        """根据当前维持担保比例刷新追保/强平标记。"""
+        if not self.margin_enabled:
+            self.margin_call_active = False
+            self.margin_liquidation_pending = False
+            return {'status': 'disabled'}
+
+        state = self.get_margin_risk_state()
+        status = state['status']
+        self.margin_call_active = status in ('margin_call', 'liquidation')
+        if status == 'liquidation':
+            self.margin_liquidation_pending = True
+        elif state['total_debit'] <= 0:
+            self.margin_liquidation_pending = False
+        return state
+
+    def clear_margin_liquidation_flag(self):
+        """清除待强平标记。"""
+        self.margin_liquidation_pending = False
 
     def get_margin_capacity(self, side):
         """按保证金比例估算新增两融可用额度。"""
         if not self.margin_enabled:
             return 0.0
 
-        summary = self.get_margin_account_summary()
-        spare_equity = max(summary['net_asset'] - self.get_margin_required_collateral(), 0.0)
+        state = self.refresh_margin_risk_flags()
+        if state.get('status') != 'normal':
+            return 0.0
+
+        spare_equity = max(self.portfolio_value - self.get_margin_required_collateral(), 0.0)
         if side == 'cash':
             ratio = self.margin_config['margincash_margin_rate']
         else:
@@ -678,21 +749,30 @@ class Portfolio:
         item['open_dt'] = item.get('open_dt') or dt
         self._invalidate_cache()
 
+    def repay_margin_interest(self, value):
+        """优先偿还已计提的两融利息。"""
+        repay_value = min(float(value), max(self.margin_interest, 0.0))
+        if repay_value <= 0:
+            return 0.0
+        self.margin_interest = max(self.margin_interest - repay_value, 0.0)
+        self._invalidate_cache()
+        return repay_value
+
     def repay_margin_cash(self, stock, amount, repayment_value):
-        """归还融资负债。"""
+        """归还融资本金负债。"""
         item = self.margin_cash_positions.get(stock)
         if item is None:
             return 0.0
 
         current_amount = int(item.get('amount', 0) or 0)
         current_debt = float(item.get('debt_balance', 0.0) or 0.0)
-        repaid_amount = min(int(amount), current_amount)
-        repaid_value = min(float(repayment_value), current_debt)
+        repaid_amount = min(max(int(amount), 0), current_amount)
+        repaid_value = min(max(float(repayment_value), 0.0), current_debt)
 
-        remaining_amount = current_amount - repaid_amount
+        remaining_amount = max(current_amount - repaid_amount, 0)
         remaining_debt = max(current_debt - repaid_value, 0.0)
 
-        if remaining_amount <= 0 or remaining_debt <= 1e-8:
+        if remaining_amount <= 0 and remaining_debt <= 1e-8:
             del self.margin_cash_positions[stock]
         else:
             item['amount'] = remaining_amount
@@ -714,11 +794,9 @@ class Portfolio:
             if debt <= 0:
                 continue
             current_amount = int(self.margin_cash_positions[stock].get('amount', 0) or 0)
-            if current_amount <= 0:
-                continue
             repay_value = min(remaining, debt)
-            repay_amount = int(round(current_amount * (repay_value / debt))) if debt > 0 else 0
-            if repay_value >= debt or repay_amount <= 0:
+            repay_amount = int(round(current_amount * (repay_value / debt))) if debt > 0 and current_amount > 0 else 0
+            if repay_value >= debt:
                 repay_amount = current_amount
             actual = self.repay_margin_cash(stock, repay_amount, repay_value)
             remaining -= actual
@@ -772,12 +850,15 @@ class Portfolio:
         """返回当前未结两融合约。"""
         rows = []
         for stock, item in self.margin_cash_positions.items():
+            last_price = self._get_market_price(stock, item.get('open_price', 0.0))
             rows.append({
                 'compact_id': 'MC_{}'.format(stock.replace('.', '_')),
                 'stock_code': stock,
                 'compact_type': 'margincash',
                 'amount': int(item.get('amount', 0) or 0),
                 'open_price': round(float(item.get('open_price', 0.0) or 0.0), 4),
+                'last_price': round(float(last_price), 4),
+                'market_value': round(int(item.get('amount', 0) or 0) * last_price, 2),
                 'debt_balance': round(float(item.get('debt_balance', 0.0) or 0.0), 2),
                 'open_dt': item.get('open_dt'),
             })
@@ -789,18 +870,36 @@ class Portfolio:
                 'compact_type': 'marginsec',
                 'amount': int(item.get('amount', 0) or 0),
                 'open_price': round(float(item.get('open_price', 0.0) or 0.0), 4),
+                'last_price': round(float(price), 4),
+                'market_value': round(int(item.get('amount', 0) or 0) * price, 2),
                 'debt_balance': round(int(item.get('amount', 0) or 0) * price, 2),
                 'open_dt': item.get('open_dt'),
             })
 
         if not rows:
-            return pd.DataFrame(columns=['compact_id', 'stock_code', 'compact_type', 'amount', 'open_price', 'debt_balance', 'open_dt'])
+            return pd.DataFrame(columns=['compact_id', 'stock_code', 'compact_type', 'amount', 'open_price', 'last_price', 'market_value', 'debt_balance', 'open_dt'])
         return pd.DataFrame(rows)
 
     def get_margin_snapshot_rows(self, name_map=None):
         """导出当前两融头寸快照。"""
         name_map = name_map or {}
         rows = []
+        for stock, item in self.margin_cash_positions.items():
+            amount = int(item.get('amount', 0) or 0)
+            debt_balance = float(item.get('debt_balance', 0.0) or 0.0)
+            if amount <= 0 and debt_balance <= 1e-8:
+                continue
+            price = self._get_market_price(stock, item.get('open_price', 0.0))
+            rows.append({
+                'c': stock,
+                'nm': name_map.get(stock, stock),
+                'n': amount,
+                'v': round(amount * price, 2),
+                'b': round(float(item.get('open_price', 0.0) or 0.0), 2),
+                'bt': 'MARGIN_CASH',
+                'debt_balance': round(debt_balance, 2),
+                'open_dt': item.get('open_dt'),
+            })
         for stock, item in self.margin_short_positions.items():
             amount = int(item.get('amount', 0) or 0)
             if amount <= 0:
@@ -813,6 +912,8 @@ class Portfolio:
                 'v': round(amount * price, 2),
                 'b': round(float(item.get('open_price', 0.0) or 0.0), 2),
                 'bt': 'MARGIN_SHORT',
+                'debt_balance': round(amount * price, 2),
+                'open_dt': item.get('open_dt'),
             })
         return rows
 
@@ -885,13 +986,16 @@ class Portfolio:
 
     @property
     def cash(self):
-        """当前可用资金"""
+        """当前现金余额（未扣除两融保证金占用）。"""
         return self._cash
 
     @property
     def available_cash(self):
-        """当前可用资金（别名）"""
-        return self._cash
+        """当前可自由用于新增交易的资金。"""
+        if not self.margin_enabled:
+            return self._cash
+        spare_equity = max(self.portfolio_value - self.get_margin_required_collateral(), 0.0)
+        return max(min(self._cash, spare_equity), 0.0)
 
     @property
     def capital_used(self):
