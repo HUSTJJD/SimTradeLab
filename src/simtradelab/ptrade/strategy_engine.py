@@ -22,7 +22,7 @@ from typing import Any, Callable, Optional
 from .context import Context
 
 # 策略代码禁止导入的模块（与Ptrade平台一致）
-_current_backtest_date: str | None = None
+_current_backtest_date: Optional[str] = None
 
 _BLOCKED_MODULES = frozenset({
     'os', 'sys', 'io', 'subprocess', 'shutil', 'socket', 'http', 'urllib',

@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-
+from typing import Optional
 from simtradelab.ptrade.context import Context
 
 
@@ -33,7 +33,7 @@ class BacktestStats:
 class StatsCollector:
     """回测统计数据收集器"""
 
-    def __init__(self, name_map: dict | None = None):
+    def __init__(self, name_map: Optional[dict] = None):
         self._stats = BacktestStats()
         self._name_map: dict[str, str] = name_map or {}
 

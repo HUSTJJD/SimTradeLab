@@ -190,12 +190,12 @@ class DataServer:
             print("\n[1] 股票价格（跳过）")
             self.stock_data_dict = LazyDataDict(self.data_path, 'stock', [], preload=False)
 
-        # 分钟数据（按需加载）
+        # 分钟数据（按需加载，避免全市场 1m 预加载压垮内存）
         if 'price_1m' in required_data and self._stock_1m_keys_cache:
-            print(f"[1.1] 分钟数据（{len(self._stock_1m_keys_cache)}只）...")
+            print(f"[1.1] 分钟数据（{len(self._stock_1m_keys_cache)}只，延迟加载）...")
             self.stock_data_dict_1m = LazyDataDict(
                 self.data_path, 'stock_1m', self._stock_1m_keys_cache,
-                preload=True
+                preload=False
             )
         else:
             # 延迟加载模式
@@ -341,10 +341,10 @@ class DataServer:
             )
 
         if 'price_1m' in missing and self._stock_1m_keys_cache is not None:
-            print(f"  加载分钟数据（{len(self._stock_1m_keys_cache)}只）...")
+            print(f"  加载分钟数据（{len(self._stock_1m_keys_cache)}只，延迟加载）...")
             self.stock_data_dict_1m = LazyDataDict(
                 self.data_path, 'stock_1m', self._stock_1m_keys_cache,
-                preload=True
+                preload=False
             )
 
         # 更新已加载记录
