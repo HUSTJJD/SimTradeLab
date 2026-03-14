@@ -320,6 +320,9 @@ class StrategyExecutionEngine:
             # 执行 run_daily 注册的任务（日频固定在15:00执行）
             self._execute_daily_tasks()
 
+            # 日终计提融资融券利息
+            self.context.portfolio.accrue_margin_interest(current_date)
+
             # 收集交易金额（从OrderProcessor累计的gross金额）
             self.stats_collector.collect_trading_amounts(self.context)
 
@@ -408,6 +411,9 @@ class StrategyExecutionEngine:
             self.context.current_dt = current_date.replace(hour=15, minute=0, second=0)
             data = Data(self.context.current_dt, self.context.portfolio._bt_ctx)
             self._safe_call('after_trading_end', LifecyclePhase.AFTER_TRADING_END, data, allow_fail=True)
+
+            # 日终计提融资融券利息
+            self.context.portfolio.accrue_margin_interest(self.context.current_dt)
 
             # 收集交易金额（从OrderProcessor累计的gross金额）
             self.stats_collector.collect_trading_amounts(self.context)

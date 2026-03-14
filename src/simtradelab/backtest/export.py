@@ -68,6 +68,9 @@ def _export_daily_stats(stats: BacktestStats, output_dir: str, suffix: str) -> s
         'buy_amount': _pad(stats.daily_buy_amount),
         'sell_amount': _pad(stats.daily_sell_amount),
         'positions_value': _pad(stats.daily_positions_value),
+        'cash_liability': _pad(getattr(stats, 'daily_cash_liability', [])),
+        'sec_liability': _pad(getattr(stats, 'daily_sec_liability', [])),
+        'margin_interest': _pad(getattr(stats, 'daily_margin_interest', [])),
     })
     path = os.path.join(output_dir, f"daily_stats_{suffix}.csv")
     df.to_csv(path, index=False, encoding='utf-8-sig')
@@ -86,8 +89,9 @@ def _export_positions(stats: BacktestStats, output_dir: str, suffix: str) -> str
                 'amount': pos['n'],
                 'market_value': pos['v'],
                 'cost_basis': pos['b'],
+                'business_type': pos.get('bt', 'STOCK'),
             })
-    df = pd.DataFrame(rows, columns=['date', 'stock_code', 'name', 'amount', 'market_value', 'cost_basis'])
+    df = pd.DataFrame(rows, columns=['date', 'stock_code', 'name', 'amount', 'market_value', 'cost_basis', 'business_type'])
     path = os.path.join(output_dir, f"positions_history_{suffix}.csv")
     df.to_csv(path, index=False, encoding='utf-8-sig')
     return path

@@ -1473,6 +1473,303 @@ class PtradeAPI:
             return self.context.blotter.cancel_order(order)
         return False
 
+    # ==================== 融资融券API ====================
+
+    def _ensure_margin_account_enabled(self) -> None:
+        if not self.context or not self.context.portfolio:
+            raise RuntimeError('当前上下文不可用，无法执行融资融券操作')
+        self.context.portfolio.ensure_margin_enabled()
+
+    def _normalize_margin_amount(self, amount: int, available: int = 0) -> int:
+        """按 A 股整手规则调整两融数量。"""
+        amount = int(amount)
+        if amount <= 0:
+            return 0
+        if available > 0 and amount >= available:
+            return int(available)
+        normalized = (amount // 100) * 100
+        if normalized <= 0 and 0 < available < 100:
+            return int(available)
+        return normalized
+
+    def _finalize_margin_order(self, security: str, amount: int, price: float, business_type: str) -> str:
+        """创建并立即完成一笔两融订单。"""
+        order_id, order = self.order_processor.create_order(security, amount, price)
+        order.status = '8'
+        order.filled = amount
+        order.business_type = business_type
+        if self.context and self.context.blotter:
+            self.context.blotter.all_orders.append(order)
+            self.context.blotter.filled_orders.append(order)
+        return order_id
+
+    @validate_lifecycle
+    def margin_trade(self, security: str, amount: int, limit_price: float = None, market_type: int = None) -> Optional[str]:
+        """信用账户中的担保品普通买卖，复用普通 order 逻辑。"""
+        _ = market_type
+        self._ensure_margin_account_enabled()
+        return self.order(security, amount, limit_price)
+
+    @validate_lifecycle
+    def margincash_open(self, security: str, amount: int, limit_price: float = None, market_type: int = None) -> Optional[str]:
+        """融资买入。"""
+        _ = market_type
+        self._ensure_margin_account_enabled()
+        price = self._get_price_and_check_limit(security, limit_price, abs(amount))
+        if price is None:
+            return None
+
+        amount = self._normalize_margin_amount(amount)
+        if amount <= 0:
+            self.log.warning('融资买入失败 %s | 原因: 数量不足一手', security)
+            return None
+
+        max_value = self.context.portfolio.get_margin_capacity('cash')
+        trade_value = amount * price
+        if trade_value > max_value + 1e-8:
+            adjusted = self._normalize_margin_amount(int(max_value / price), available=amount)
+            if adjusted <= 0:
+                self.log.warning('融资买入失败 %s | 原因: 保证金不足', security)
+                return None
+            self.log.info('融资买入保证金不足，调整 %s 数量 %s -> %s', security, amount, adjusted)
+            amount = adjusted
+            trade_value = amount * price
+
+        commission = self.order_processor.calculate_commission(amount, price, is_sell=False)
+        if commission > self.context.portfolio.cash + 1e-8:
+            self.log.warning('融资买入失败 %s | 原因: 现金不足以支付手续费 %.2f', security, commission)
+            return None
+
+        self.context.portfolio._cash -= commission
+        self.context.portfolio.add_position(security, amount, price + commission / amount, self.context.current_dt)
+        position = self.context.portfolio.positions.get(security)
+        if position is not None:
+            position.business_type = 'MARGIN_CASH'
+        self.context.portfolio.record_margin_cash_open(security, amount, price, self.context.current_dt)
+        self.context._daily_buy_total += trade_value
+        self.context._daily_buy_commission = getattr(self.context, '_daily_buy_commission', 0.0) + commission
+        if not hasattr(self.context, 'total_commission'):
+            self.context.total_commission = 0
+        self.context.total_commission += commission
+        self.log.info('融资买入成交 %s | %s 股 | 价格 %.3f | 负债 %.2f', security, amount, price, trade_value)
+        return self._finalize_margin_order(security, amount, price, 'MARGIN_CASH_OPEN')
+
+    @validate_lifecycle
+    def margincash_close(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """卖券还款。"""
+        self._ensure_margin_account_enabled()
+        position = self.context.portfolio.positions.get(security)
+        debt_item = self.context.portfolio.margin_cash_positions.get(security)
+        if position is None or debt_item is None:
+            self.log.warning('卖券还款失败 %s | 原因: 无融资持仓或负债', security)
+            return None
+
+        available = min(int(position.amount), int(debt_item.get('amount', 0) or 0))
+        if self.context.t_plus_1:
+            available = min(available, int(position.enable_amount))
+        amount = self._normalize_margin_amount(amount, available=available)
+        if amount <= 0:
+            self.log.warning('卖券还款失败 %s | 原因: 可卖数量不足', security)
+            return None
+
+        price = self._get_price_and_check_limit(security, limit_price, -amount)
+        if price is None:
+            return None
+
+        revenue = amount * price
+        commission = self.order_processor.calculate_commission(amount, price, is_sell=True)
+        tax_adjustment = self.context.portfolio.remove_position(security, amount, self.context.current_dt)
+        repaid = self.context.portfolio.repay_margin_cash(security, amount, revenue)
+        cash_delta = revenue - repaid - commission - tax_adjustment
+        self.context.portfolio._cash += cash_delta
+        self.context._daily_sell_total += revenue
+        if not hasattr(self.context, 'total_commission'):
+            self.context.total_commission = 0
+        self.context.total_commission += commission
+        self.log.info('卖券还款成交 %s | %s 股 | 价格 %.3f | 偿还 %.2f', security, amount, price, repaid)
+        return self._finalize_margin_order(security, -amount, price, 'MARGIN_CASH_CLOSE')
+
+    @validate_lifecycle
+    def margincash_direct_refund(self, value: float) -> None:
+        """直接还款。"""
+        self._ensure_margin_account_enabled()
+        repay_value = min(float(value), self.context.portfolio.cash, self.context.portfolio.cash_liability)
+        if repay_value <= 0:
+            self.log.info('直接还款跳过 | 当前无可归还融资负债或现金不足')
+            return
+        actual = self.context.portfolio.repay_margin_cash_with_value(repay_value)
+        self.context.portfolio._cash -= actual
+        self.log.info('直接还款完成 | 金额 %.2f', actual)
+
+    @validate_lifecycle
+    def marginsec_open(self, security: str, amount: int, limit_price: float = None, market_type: int = None) -> Optional[str]:
+        """融券卖出。"""
+        _ = market_type
+        self._ensure_margin_account_enabled()
+        price = self._get_price_and_check_limit(security, limit_price, -abs(amount))
+        if price is None:
+            return None
+
+        amount = self._normalize_margin_amount(amount)
+        if amount <= 0:
+            self.log.warning('融券卖出失败 %s | 原因: 数量不足一手', security)
+            return None
+
+        max_value = self.context.portfolio.get_margin_capacity('sec')
+        trade_value = amount * price
+        if trade_value > max_value + 1e-8:
+            adjusted = self._normalize_margin_amount(int(max_value / price), available=amount)
+            if adjusted <= 0:
+                self.log.warning('融券卖出失败 %s | 原因: 保证金不足', security)
+                return None
+            self.log.info('融券卖出保证金不足，调整 %s 数量 %s -> %s', security, amount, adjusted)
+            amount = adjusted
+            trade_value = amount * price
+
+        commission = self.order_processor.calculate_commission(amount, price, is_sell=True)
+        self.context.portfolio._cash += trade_value - commission
+        self.context.portfolio.record_margin_short_open(security, amount, price, self.context.current_dt)
+        self.context._daily_sell_total += trade_value
+        if not hasattr(self.context, 'total_commission'):
+            self.context.total_commission = 0
+        self.context.total_commission += commission
+        self.log.info('融券卖出成交 %s | %s 股 | 价格 %.3f | 卖出额 %.2f', security, amount, price, trade_value)
+        return self._finalize_margin_order(security, -amount, price, 'MARGIN_SEC_OPEN')
+
+    @validate_lifecycle
+    def marginsec_close(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """买券还券。"""
+        self._ensure_margin_account_enabled()
+        short_item = self.context.portfolio.margin_short_positions.get(security)
+        if short_item is None:
+            self.log.warning('买券还券失败 %s | 原因: 无融券负债', security)
+            return None
+
+        available = int(short_item.get('amount', 0) or 0)
+        amount = self._normalize_margin_amount(amount, available=available)
+        if amount <= 0:
+            self.log.warning('买券还券失败 %s | 原因: 可平数量不足', security)
+            return None
+
+        price = self._get_price_and_check_limit(security, limit_price, amount)
+        if price is None:
+            return None
+
+        trade_value = amount * price
+        commission = self.order_processor.calculate_commission(amount, price, is_sell=False)
+        total_cost = trade_value + commission
+        if total_cost > self.context.portfolio.cash + 1e-8:
+            self.log.warning('买券还券失败 %s | 原因: 现金不足 (需要 %.2f, 可用 %.2f)', security, total_cost, self.context.portfolio.cash)
+            return None
+
+        self.context.portfolio._cash -= total_cost
+        self.context.portfolio.reduce_margin_short(security, amount)
+        self.context._daily_buy_total += trade_value
+        self.context._daily_buy_commission = getattr(self.context, '_daily_buy_commission', 0.0) + commission
+        if not hasattr(self.context, 'total_commission'):
+            self.context.total_commission = 0
+        self.context.total_commission += commission
+        self.log.info('买券还券成交 %s | %s 股 | 价格 %.3f | 买回额 %.2f', security, amount, price, trade_value)
+        return self._finalize_margin_order(security, amount, price, 'MARGIN_SEC_CLOSE')
+
+    @validate_lifecycle
+    def marginsec_direct_refund(self, security: str, amount: int) -> None:
+        """直接还券。"""
+        self._ensure_margin_account_enabled()
+        short_item = self.context.portfolio.margin_short_positions.get(security)
+        position = self.context.portfolio.positions.get(security)
+        if short_item is None or position is None:
+            self.log.info('直接还券跳过 %s | 当前无融券负债或无可转出的证券持仓', security)
+            return
+
+        available = min(int(short_item.get('amount', 0) or 0), int(position.amount))
+        amount = self._normalize_margin_amount(amount, available=available)
+        if amount <= 0:
+            self.log.info('直接还券跳过 %s | 数量不足', security)
+            return
+
+        self.context.portfolio.remove_position(security, amount, self.context.current_dt)
+        self.context.portfolio.reduce_margin_short(security, amount)
+        self.log.info('直接还券完成 %s | %s 股', security, amount)
+
+    def get_margincash_stocks(self) -> list[str]:
+        """获取可融资标的列表（本地回测近似返回全部可交易标的）。"""
+        return sorted(self.data_context.stock_data_dict.keys())
+
+    def get_marginsec_stocks(self) -> list[str]:
+        """获取可融券标的列表（本地回测近似返回全部可交易标的）。"""
+        return sorted(self.data_context.stock_data_dict.keys())
+
+    def get_assure_security_list(self) -> list[str]:
+        """获取可作为担保品的证券列表。"""
+        return sorted(self.data_context.stock_data_dict.keys())
+
+    def get_margin_contract(self) -> pd.DataFrame:
+        """查询当前未结两融合约。"""
+        self._ensure_margin_account_enabled()
+        return self.context.portfolio.get_margin_contracts_frame()
+
+    def get_margin_contractreal(self) -> pd.DataFrame:
+        """实盘接口兼容别名。"""
+        return self.get_margin_contract()
+
+    def get_margin_assert(self) -> dict:
+        """查询信用账户资产摘要。"""
+        self._ensure_margin_account_enabled()
+        return self.context.portfolio.get_margin_account_summary()
+
+    def get_margincash_open_amount(self, security: str, price: float = None) -> int:
+        """获取最大可融资买入数量。"""
+        self._ensure_margin_account_enabled()
+        price = price or self.order_processor.get_execution_price(security, None, True)
+        if price is None or price <= 0:
+            return 0
+        capacity = self.context.portfolio.get_margin_capacity('cash')
+        return self._normalize_margin_amount(int(capacity / price))
+
+    def get_margincash_close_amount(self, security: str, price: float = None) -> int:
+        """获取最大可卖券还款数量。"""
+        _ = price
+        item = self.context.portfolio.margin_cash_positions.get(security, {})
+        return int(item.get('amount', 0) or 0)
+
+    def get_marginsec_open_amount(self, security: str, price: float = None) -> int:
+        """获取最大可融券卖出数量。"""
+        self._ensure_margin_account_enabled()
+        price = price or self.order_processor.get_execution_price(security, None, False)
+        if price is None or price <= 0:
+            return 0
+        capacity = self.context.portfolio.get_margin_capacity('sec')
+        return self._normalize_margin_amount(int(capacity / price))
+
+    def get_marginsec_close_amount(self, security: str, price: float = None) -> int:
+        """获取最大可买券还券数量。"""
+        _ = price
+        item = self.context.portfolio.margin_short_positions.get(security, {})
+        return int(item.get('amount', 0) or 0)
+
+    def get_margin_entrans_amount(self, security: str) -> int:
+        """获取可直接还券数量。"""
+        position = self.context.portfolio.positions.get(security)
+        if position is None:
+            return 0
+        short_item = self.context.portfolio.margin_short_positions.get(security, {})
+        return min(int(position.amount), int(short_item.get('amount', 0) or 0))
+
+    def get_enslo_security_info(self) -> pd.DataFrame:
+        """查询当前融券头寸信息。"""
+        rows = []
+        for stock, item in self.context.portfolio.margin_short_positions.items():
+            rows.append({
+                'stock_code': stock,
+                'amount': int(item.get('amount', 0) or 0),
+                'open_price': round(float(item.get('open_price', 0.0) or 0.0), 4),
+                'market_value': round(float(item.get('market_value', 0.0) or 0.0), 2),
+            })
+        if not rows:
+            return pd.DataFrame(columns=['stock_code', 'amount', 'open_price', 'market_value'])
+        return pd.DataFrame(rows)
+
     # ==================== 配置API ====================
 
     @validate_lifecycle

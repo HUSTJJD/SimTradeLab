@@ -465,6 +465,7 @@ class Order(BaseModel):
     entrust_no: str = Field(default='', description="委托编号")
     priceGear: Optional[int] = Field(default=None, description="盘口档位")
     status: str = Field(default='0', description="订单状态：'0'未报, '1'待报, '2'已报")
+    business_type: str = Field(default='STOCK', description="业务类型：普通股票、融资买入、融券卖出等")
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -491,6 +492,329 @@ class Portfolio:
         self._close_price_cache_date = None
         # 持股批次追踪（用于分红税FIFO计算）
         self._position_lots = {}
+
+        # 融资融券账户状态
+        self.margin_enabled = False
+        self.margin_config = {
+            'margincash_interest_rate': 0.0,
+            'margincash_margin_rate': 1.0,
+            'marginsec_interest_rate': 0.0,
+            'marginsec_margin_rate': 1.0,
+        }
+        self.margin_cash_positions = {}
+        self.margin_short_positions = {}
+        self.margin_interest = 0.0
+        self.margin_last_accrual_date = None
+        self.short_positions_value = 0.0
+
+    def enable_margin_account(self, margincash_interest_rate=0.08,
+                              margincash_margin_rate=1.5,
+                              marginsec_interest_rate=0.10,
+                              marginsec_margin_rate=1.5):
+        """启用融资融券账户模拟。"""
+        self.margin_enabled = True
+        self.margin_config = {
+            'margincash_interest_rate': float(margincash_interest_rate),
+            'margincash_margin_rate': float(margincash_margin_rate),
+            'marginsec_interest_rate': float(marginsec_interest_rate),
+            'marginsec_margin_rate': float(marginsec_margin_rate),
+        }
+        if self._context is not None and self.margin_last_accrual_date is None and self._context.current_dt is not None:
+            self.margin_last_accrual_date = self._context.current_dt.date()
+        self._invalidate_cache()
+
+    def ensure_margin_enabled(self):
+        """确保当前账户已启用融资融券。"""
+        if not self.margin_enabled:
+            raise RuntimeError('当前账户未启用融资融券，请在回测配置中设置 enable_margin_account=true')
+
+    @property
+    def cash_liability(self):
+        """当前融资负债。"""
+        return sum(item.get('debt_balance', 0.0) for item in self.margin_cash_positions.values())
+
+    def _get_market_price(self, stock, fallback=None):
+        """获取当前回测时间对应的市场价格。"""
+        current_price = fallback
+        if current_price is None and stock in self.positions:
+            current_price = self.positions[stock].cost_basis
+
+        if stock in self._close_price_cache:
+            return self._close_price_cache[stock]
+
+        if self._bt_ctx and self._bt_ctx.get_stock_date_index:
+            stock_df = self._bt_ctx.stock_data_dict.get(stock)
+            if stock_df is not None and isinstance(stock_df, pd.DataFrame) and self._context:
+                date_dict, _ = self._bt_ctx.get_stock_date_index(stock)
+                idx = date_dict.get(self._context.current_dt.value)
+                if idx is not None:
+                    price = stock_df['close'].values[idx]
+                    if not np.isnan(price) and price > 0:
+                        current_price = float(price)
+
+        if current_price is None:
+            current_price = 0.0
+
+        self._close_price_cache[stock] = current_price
+        return current_price
+
+    def get_marginsec_liability_value(self):
+        """按市值计算当前融券负债。"""
+        total = 0.0
+        for stock, info in self.margin_short_positions.items():
+            amount = int(info.get('amount', 0) or 0)
+            if amount <= 0:
+                continue
+            price = self._get_market_price(stock, info.get('open_price', 0.0))
+            info['last_price'] = price
+            info['market_value'] = round(amount * price, 2)
+            total += info['market_value']
+        self.short_positions_value = total
+        return total
+
+    @property
+    def sec_liability(self):
+        """当前融券负债。"""
+        return self.get_marginsec_liability_value()
+
+    def get_margin_required_collateral(self):
+        """计算当前两融占用的保证金需求。"""
+        if not self.margin_enabled:
+            return 0.0
+        return (
+            self.cash_liability * self.margin_config['margincash_margin_rate'] +
+            self.get_marginsec_liability_value() * self.margin_config['marginsec_margin_rate']
+        )
+
+    def get_margin_account_summary(self):
+        """汇总信用账户资产负债。"""
+        portfolio_value = self.portfolio_value
+        assure_asset = self._cash + self.positions_value
+        cash_liability = self.cash_liability
+        sec_liability = self.short_positions_value
+        total_debit = cash_liability + sec_liability + self.margin_interest
+        net_asset = portfolio_value
+        required_collateral = self.get_margin_required_collateral()
+        enable_bail_balance = max(net_asset - required_collateral, 0.0)
+        maintenance_margin_rate = assure_asset / total_debit if total_debit > 0 else float('inf')
+        return {
+            'assure_asset': round(assure_asset, 2),
+            'portfolio_value': round(portfolio_value, 2),
+            'net_asset': round(net_asset, 2),
+            'total_debit': round(total_debit, 2),
+            'cash_liability': round(cash_liability, 2),
+            'sec_liability': round(sec_liability, 2),
+            'interest': round(self.margin_interest, 2),
+            'enable_bail_balance': round(enable_bail_balance, 2),
+            'maintenance_margin_rate': round(maintenance_margin_rate, 6) if np.isfinite(maintenance_margin_rate) else float('inf'),
+        }
+
+    def get_margin_capacity(self, side):
+        """按保证金比例估算新增两融可用额度。"""
+        if not self.margin_enabled:
+            return 0.0
+
+        summary = self.get_margin_account_summary()
+        spare_equity = max(summary['net_asset'] - self.get_margin_required_collateral(), 0.0)
+        if side == 'cash':
+            ratio = self.margin_config['margincash_margin_rate']
+        else:
+            ratio = self.margin_config['marginsec_margin_rate']
+        if ratio <= 0:
+            return 0.0
+        return spare_equity / ratio
+
+    def accrue_margin_interest(self, current_dt=None):
+        """按自然日计提两融利息。"""
+        if not self.margin_enabled:
+            return 0.0
+
+        if current_dt is None and self._context is not None:
+            current_dt = self._context.current_dt
+        if current_dt is None:
+            return 0.0
+
+        current_date = current_dt.date()
+        if self.margin_last_accrual_date is None:
+            self.margin_last_accrual_date = current_date
+            return 0.0
+
+        days = (current_date - self.margin_last_accrual_date).days
+        if days <= 0:
+            return 0.0
+
+        interest = (
+            self.cash_liability * self.margin_config['margincash_interest_rate'] / 365.0 +
+            self.get_marginsec_liability_value() * self.margin_config['marginsec_interest_rate'] / 365.0
+        ) * days
+        self.margin_interest += interest
+        self.margin_last_accrual_date = current_date
+        self._invalidate_cache()
+        return interest
+
+    def record_margin_cash_open(self, stock, amount, price, dt):
+        """记录融资买入负债。"""
+        self.ensure_margin_enabled()
+        if stock not in self.margin_cash_positions:
+            self.margin_cash_positions[stock] = {
+                'stock_code': stock,
+                'amount': 0,
+                'open_price': 0.0,
+                'debt_balance': 0.0,
+                'open_dt': dt,
+                'business_type': 'MARGIN_CASH',
+            }
+
+        item = self.margin_cash_positions[stock]
+        old_amount = int(item.get('amount', 0) or 0)
+        new_amount = old_amount + int(amount)
+        debt = float(amount) * float(price)
+        if new_amount > 0:
+            item['open_price'] = (
+                old_amount * float(item.get('open_price', 0.0)) + float(amount) * float(price)
+            ) / new_amount
+        item['amount'] = new_amount
+        item['debt_balance'] = float(item.get('debt_balance', 0.0)) + debt
+        item['open_dt'] = item.get('open_dt') or dt
+        self._invalidate_cache()
+
+    def repay_margin_cash(self, stock, amount, repayment_value):
+        """归还融资负债。"""
+        item = self.margin_cash_positions.get(stock)
+        if item is None:
+            return 0.0
+
+        current_amount = int(item.get('amount', 0) or 0)
+        current_debt = float(item.get('debt_balance', 0.0) or 0.0)
+        repaid_amount = min(int(amount), current_amount)
+        repaid_value = min(float(repayment_value), current_debt)
+
+        remaining_amount = current_amount - repaid_amount
+        remaining_debt = max(current_debt - repaid_value, 0.0)
+
+        if remaining_amount <= 0 or remaining_debt <= 1e-8:
+            del self.margin_cash_positions[stock]
+        else:
+            item['amount'] = remaining_amount
+            item['debt_balance'] = remaining_debt
+
+        self._invalidate_cache()
+        return repaid_value
+
+    def repay_margin_cash_with_value(self, value):
+        """按金额直接还款，按融资负债占比分摊。"""
+        remaining = float(value)
+        if remaining <= 0:
+            return 0.0
+
+        for stock in list(self.margin_cash_positions.keys()):
+            if remaining <= 1e-8:
+                break
+            debt = float(self.margin_cash_positions[stock].get('debt_balance', 0.0) or 0.0)
+            if debt <= 0:
+                continue
+            current_amount = int(self.margin_cash_positions[stock].get('amount', 0) or 0)
+            if current_amount <= 0:
+                continue
+            repay_value = min(remaining, debt)
+            repay_amount = int(round(current_amount * (repay_value / debt))) if debt > 0 else 0
+            if repay_value >= debt or repay_amount <= 0:
+                repay_amount = current_amount
+            actual = self.repay_margin_cash(stock, repay_amount, repay_value)
+            remaining -= actual
+
+        return float(value) - remaining
+
+    def record_margin_short_open(self, stock, amount, price, dt):
+        """记录融券卖出负债。"""
+        self.ensure_margin_enabled()
+        if stock not in self.margin_short_positions:
+            self.margin_short_positions[stock] = {
+                'stock_code': stock,
+                'amount': 0,
+                'open_price': 0.0,
+                'open_dt': dt,
+                'business_type': 'MARGIN_SHORT',
+                'last_price': float(price),
+                'market_value': 0.0,
+            }
+
+        item = self.margin_short_positions[stock]
+        old_amount = int(item.get('amount', 0) or 0)
+        new_amount = old_amount + int(amount)
+        if new_amount > 0:
+            item['open_price'] = (
+                old_amount * float(item.get('open_price', 0.0)) + float(amount) * float(price)
+            ) / new_amount
+        item['amount'] = new_amount
+        item['open_dt'] = item.get('open_dt') or dt
+        item['last_price'] = float(price)
+        item['market_value'] = round(new_amount * float(price), 2)
+        self._invalidate_cache()
+
+    def reduce_margin_short(self, stock, amount):
+        """减少融券负债。"""
+        item = self.margin_short_positions.get(stock)
+        if item is None:
+            return 0
+
+        current_amount = int(item.get('amount', 0) or 0)
+        reduced = min(int(amount), current_amount)
+        remaining = current_amount - reduced
+        if remaining <= 0:
+            del self.margin_short_positions[stock]
+        else:
+            item['amount'] = remaining
+        self._invalidate_cache()
+        return reduced
+
+    def get_margin_contracts_frame(self):
+        """返回当前未结两融合约。"""
+        rows = []
+        for stock, item in self.margin_cash_positions.items():
+            rows.append({
+                'compact_id': 'MC_{}'.format(stock.replace('.', '_')),
+                'stock_code': stock,
+                'compact_type': 'margincash',
+                'amount': int(item.get('amount', 0) or 0),
+                'open_price': round(float(item.get('open_price', 0.0) or 0.0), 4),
+                'debt_balance': round(float(item.get('debt_balance', 0.0) or 0.0), 2),
+                'open_dt': item.get('open_dt'),
+            })
+        for stock, item in self.margin_short_positions.items():
+            price = self._get_market_price(stock, item.get('open_price', 0.0))
+            rows.append({
+                'compact_id': 'MS_{}'.format(stock.replace('.', '_')),
+                'stock_code': stock,
+                'compact_type': 'marginsec',
+                'amount': int(item.get('amount', 0) or 0),
+                'open_price': round(float(item.get('open_price', 0.0) or 0.0), 4),
+                'debt_balance': round(int(item.get('amount', 0) or 0) * price, 2),
+                'open_dt': item.get('open_dt'),
+            })
+
+        if not rows:
+            return pd.DataFrame(columns=['compact_id', 'stock_code', 'compact_type', 'amount', 'open_price', 'debt_balance', 'open_dt'])
+        return pd.DataFrame(rows)
+
+    def get_margin_snapshot_rows(self, name_map=None):
+        """导出当前两融头寸快照。"""
+        name_map = name_map or {}
+        rows = []
+        for stock, item in self.margin_short_positions.items():
+            amount = int(item.get('amount', 0) or 0)
+            if amount <= 0:
+                continue
+            price = self._get_market_price(stock, item.get('open_price', 0.0))
+            rows.append({
+                'c': stock,
+                'nm': name_map.get(stock, stock),
+                'n': -amount,
+                'v': round(amount * price, 2),
+                'b': round(float(item.get('open_price', 0.0) or 0.0), 2),
+                'bt': 'MARGIN_SHORT',
+            })
+        return rows
 
     def _invalidate_cache(self):
         """清空 portfolio_value 缓存（持仓变化时调用）
@@ -538,7 +862,7 @@ class Portfolio:
                 del self._position_lots[stock]
         else:
             position.amount -= amount
-            position.enable_amount -= amount
+            position.enable_amount = max(position.enable_amount - amount, 0)
             position.market_value = position.amount * position.cost_basis
 
         self._invalidate_cache()
@@ -613,28 +937,14 @@ class Portfolio:
             if position.amount <= 0:
                 continue
 
-            # 从日缓存获取收盘价
-            if stock in self._close_price_cache:
-                current_price = self._close_price_cache[stock]
-            else:
-                current_price = position.cost_basis
-                if self._bt_ctx and self._bt_ctx.get_stock_date_index:
-                    stock_df = self._bt_ctx.stock_data_dict.get(stock)
-                    if stock_df is not None and isinstance(stock_df, pd.DataFrame) and self._context:
-                        date_dict, _ = self._bt_ctx.get_stock_date_index(stock)
-                        idx = date_dict.get(self._context.current_dt.value)
-                        if idx is not None:
-                            price = stock_df['close'].values[idx]
-                            if not np.isnan(price) and price > 0:
-                                current_price = price
-                self._close_price_cache[stock] = current_price
-
+            current_price = self._get_market_price(stock, position.cost_basis)
             position.last_sale_price = current_price
             position.market_value = position.amount * current_price
             positions_value += position.amount * current_price
 
         self.positions_value = positions_value
-        result = total + positions_value
+        short_liability = self.get_marginsec_liability_value() if self.margin_enabled else 0.0
+        result = total + positions_value - self.cash_liability - self.margin_interest - short_liability
 
         if current_date is not None:
             self._cache_date = current_date

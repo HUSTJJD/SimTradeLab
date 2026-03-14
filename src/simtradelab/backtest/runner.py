@@ -278,6 +278,21 @@ class BacktestRunner:
         # 设置portfolio的context引用
         portfolio._context = context
 
+        if config.enable_margin_account:
+            portfolio.enable_margin_account(
+                margincash_interest_rate=config.margincash_interest_rate,
+                margincash_margin_rate=config.margincash_margin_rate,
+                marginsec_interest_rate=config.marginsec_interest_rate,
+                marginsec_margin_rate=config.marginsec_margin_rate,
+            )
+            log.info(
+                '启用融资融券账户: 融资利率=%.4f 融资保证金=%.2f 融券利率=%.4f 融券保证金=%.2f',
+                config.margincash_interest_rate,
+                config.margincash_margin_rate,
+                config.marginsec_interest_rate,
+                config.marginsec_margin_rate,
+            )
+
         # 创建数据上下文
         data_context = DataContext(
             stock_data_dict=self.stock_data_dict,

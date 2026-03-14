@@ -26,6 +26,9 @@ class BacktestStats:
     daily_buy_amount: list[float] = field(default_factory=list)
     daily_sell_amount: list[float] = field(default_factory=list)
     daily_positions_value: list[float] = field(default_factory=list)
+    daily_cash_liability: list[float] = field(default_factory=list)
+    daily_sec_liability: list[float] = field(default_factory=list)
+    daily_margin_interest: list[float] = field(default_factory=list)
     trade_dates: list = field(default_factory=list)
     daily_positions_snapshot: list[list] = field(default_factory=list)
 
@@ -64,6 +67,12 @@ class StatsCollector:
         daily_pnl = current_value - prev_portfolio_value
         self._stats.daily_pnl.append(daily_pnl)
         self._stats.daily_positions_value.append(context.portfolio.positions_value)
+
+        margin_summary = context.portfolio.get_margin_account_summary() if context.portfolio.margin_enabled else {}
+        self._stats.daily_cash_liability.append(margin_summary.get('cash_liability', 0.0))
+        self._stats.daily_sec_liability.append(margin_summary.get('sec_liability', 0.0))
+        self._stats.daily_margin_interest.append(margin_summary.get('interest', 0.0))
+
         snapshot = [
             {
                 "c": pos.stock,
@@ -71,8 +80,10 @@ class StatsCollector:
                 "n": int(pos.amount),
                 "v": round(pos.market_value, 2),
                 "b": round(pos.cost_basis, 2),
+                "bt": getattr(pos, 'business_type', 'STOCK'),
             }
             for pos in context.portfolio.positions.values()
             if pos.amount > 0
         ]
+        snapshot.extend(context.portfolio.get_margin_snapshot_rows(self._name_map))
         self._stats.daily_positions_snapshot.append(snapshot)

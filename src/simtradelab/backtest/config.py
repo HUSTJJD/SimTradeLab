@@ -61,6 +61,13 @@ class BacktestConfig(BaseModel):
     # T+1交易限制：True=A股模式（当日买入不可卖），False=T+0模式（ETF/美股）
     t_plus_1: bool = True
 
+    # 融资融券账户配置
+    enable_margin_account: bool = False
+    margincash_interest_rate: float = Field(default=0.08, ge=0.0, description="融资年化利率")
+    margincash_margin_rate: float = Field(default=1.5, gt=0.0, description="融资保证金比例")
+    marginsec_interest_rate: float = Field(default=0.10, ge=0.0, description="融券年化利率")
+    marginsec_margin_rate: float = Field(default=1.5, gt=0.0, description="融券保证金比例")
+
     model_config = {"arbitrary_types_allowed": True}
 
     @field_validator('start_date', 'end_date', mode='before')
