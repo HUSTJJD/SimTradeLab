@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from datetime import datetime
 from functools import wraps
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -456,7 +456,7 @@ class Blotter:
 
 class Order(BaseModel):
     """订单对象"""
-    id: int | str = Field(..., description="订单号（支持整数或UUID字符串）")
+    id: Union[int, str] = Field(..., description="订单号（支持整数或UUID字符串）")
     dt: Optional[datetime] = Field(None, description="订单产生时间")
     symbol: str = Field(..., description="标的代码")
     amount: int = Field(..., description="下单数量（正数=买入，负数=卖出）")

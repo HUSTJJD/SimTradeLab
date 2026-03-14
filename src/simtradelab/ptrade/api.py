@@ -23,7 +23,7 @@ import traceback
 
 from collections import OrderedDict
 from functools import wraps
-from typing import Optional, Any, Callable
+from typing import Optional, Any, Callable, Union, List, Dict
 
 from .lifecycle_controller import PTradeLifecycleError
 from .lifecycle_config import API_ALLOWED_PHASES_LOOKUP, _ALL_PHASES_FROZENSET
@@ -361,7 +361,7 @@ class PtradeAPI:
     }
 
     @timer()
-    def get_fundamentals(self, security: str | list[str], table: str, fields: list[str], date: str = None) -> pd.DataFrame:
+    def get_fundamentals(self, security: Union[str, List[str]], table: str, fields: List[str], date: str = None) -> pd.DataFrame:
         """获取基本面数据（优化版：增量缓存）
 
         重要：对于fundamentals表，使用publ_date（公告日期）进行过滤，而非end_date（报告期）
@@ -516,7 +516,7 @@ class PtradeAPI:
             super().__init__(*args, **kwargs)
             self._stock_list: Optional[list[str]] = None
 
-        def __getitem__(self, key: str) -> pd.DataFrame | Any:
+        def __getitem__(self, key: str) -> Union[pd.DataFrame, Any]:
             if key in self:
                 return super().__getitem__(key)
 
@@ -554,7 +554,7 @@ class PtradeAPI:
             return self.data_context.stock_data_dict_1m
         return self.data_context.stock_data_dict
 
-    def get_price(self, security: str | list[str], start_date: str = None, end_date: str = None, frequency: str = '1d', fields: str | list[str] = None, fq: str = None, count: int = None) -> pd.DataFrame | PtradeAPI.PanelLike:
+    def get_price(self, security: Union[str, List[str]], start_date: str = None, end_date: str = None, frequency: str = '1d', fields: Union[str, List[str]] = None, fq: str = None, count: int = None) -> Union[pd.DataFrame, 'PtradeAPI.PanelLike']:
         """获取历史行情数据"""
         # 验证fq参数（get_price不支持dypre，仅get_history支持）
         valid_fq = ['pre', 'post', None]
@@ -594,10 +594,11 @@ class PtradeAPI:
                             continue
                         current_idx = idx
                     else:
+                        daily_dt = pd.Timestamp(end_dt).normalize()
                         date_dict, _ = self.get_stock_date_index(stock)
-                        current_idx = date_dict.get(end_dt.value)
+                        current_idx = date_dict.get(daily_dt.value)
                         if current_idx is None:
-                            current_idx = stock_df.index.get_loc(end_dt)
+                            current_idx = stock_df.index.get_loc(daily_dt)
                 except (KeyError, IndexError):
                     continue
 
@@ -656,7 +657,7 @@ class PtradeAPI:
         return self.PanelLike(panel_data)
 
     @timer()
-    def get_history(self, count: int, frequency: str = '1d', field: str | list[str] = 'close', security_list: str | list[str] = None, fq: str = None, include: bool = False, fill: str = 'nan', is_dict: bool = False) -> pd.DataFrame | dict | PtradeAPI.PanelLike:
+    def get_history(self, count: int, frequency: str = '1d', field: Union[str, List[str]] = 'close', security_list: Union[str, List[str]] = None, fq: str = None, include: bool = False, fill: str = 'nan', is_dict: bool = False) -> Union[pd.DataFrame, dict, 'PtradeAPI.PanelLike']:
         """模拟通用ptrade的get_history（优化批量处理+缓存）"""
         # 验证fq参数
         valid_fq = ['pre', 'post', 'dypre', None]
@@ -677,10 +678,11 @@ class PtradeAPI:
             return {} if is_dict else pd.DataFrame()
 
         current_dt = self.context.current_dt
+        lookup_dt = current_dt if frequency == '1m' else pd.Timestamp(current_dt).normalize()
 
         # 缓存键：frozenset 归一化顺序 O(n)，比 tuple(sorted()) O(n log n) 更快
         field_key = tuple(fields) if len(fields) > 1 else fields[0]
-        cache_key = (frozenset(stocks), count, field_key, fq, current_dt, include, is_dict, frequency)
+        cache_key = (frozenset(stocks), count, field_key, fq, lookup_dt, include, is_dict, frequency)
 
         # 检查缓存
         if cache_key in self._history_cache:
@@ -718,9 +720,9 @@ class PtradeAPI:
                     current_idx = idx
                 else:
                     date_dict, _ = self.get_stock_date_index(stock)
-                    current_idx = date_dict.get(current_dt.value)
+                    current_idx = date_dict.get(lookup_dt.value)
                     if current_idx is None:
-                        current_idx = data_source.index.get_loc(current_dt)
+                        current_idx = data_source.index.get_loc(lookup_dt)
                 stock_info[stock] = (data_source, current_idx)
             except (KeyError, IndexError):
                 continue
@@ -842,7 +844,7 @@ class PtradeAPI:
                 pass
         return {}
 
-    def get_stock_info(self, stocks: str | list[str], field: str | list[str] = None) -> dict[str, dict]:
+    def get_stock_info(self, stocks: Union[str, List[str]], field: Union[str, List[str]] = None) -> Dict[str, dict]:
         """获取股票基础信息"""
         if isinstance(stocks, str):
             stocks = [stocks]
@@ -873,7 +875,7 @@ class PtradeAPI:
 
         return result
 
-    def get_stock_name(self, stocks: str | list[str]) -> str | dict[str, str]:
+    def get_stock_name(self, stocks: Union[str, List[str]]) -> Union[str, Dict[str, str]]:
         """获取股票名称"""
         is_single = isinstance(stocks, str)
         if is_single:
@@ -888,7 +890,7 @@ class PtradeAPI:
 
         return result[stocks[0]] if is_single else result
 
-    def get_stock_status(self, stocks: str | list[str], query_type: str = 'ST', query_date: str = None) -> dict[str, bool]:
+    def get_stock_status(self, stocks: Union[str, List[str]], query_type: str = 'ST', query_date: str = None) -> Dict[str, bool]:
         """获取股票状态（ST/HALT/DELISTING）
 
         基于日频 stock_status_history 数据，用 bisect 查找当日快照。
@@ -1006,7 +1008,7 @@ class PtradeAPI:
 
         return []
 
-    def get_industry_stocks(self, industry_code: str = None) -> dict | list[str]:
+    def get_industry_stocks(self, industry_code: str = None) -> Union[dict, List[str]]:
         """推导行业成份股（带缓存）"""
         if self.data_context.stock_metadata.empty:
             return {} if industry_code is None else []
@@ -1049,7 +1051,7 @@ class PtradeAPI:
         else:
             return 0.10
 
-    def check_limit(self, security: str | list[str], query_date: str = None) -> dict[str, int]:
+    def check_limit(self, security: Union[str, List[str]], query_date: str = None) -> Dict[str, int]:
         """检查涨跌停状态"""
         if isinstance(security, str):
             securities = [security]
@@ -1495,7 +1497,7 @@ class PtradeAPI:
         return
 
     @validate_lifecycle
-    def set_universe(self, stocks: str | list[str]) -> None:
+    def set_universe(self, stocks: Union[str, List[str]]) -> None:
         """设置股票池并预加载数据"""
         if isinstance(stocks, list):
             new_stocks = set(stocks)
