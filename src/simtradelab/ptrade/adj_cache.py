@@ -15,9 +15,13 @@
 import pandas as pd
 import numpy as np
 import os
-from ..utils.paths import ADJ_PRE_CACHE_PATH, ADJ_POST_CACHE_PATH
 from ..utils.perf import timer
 from joblib import Parallel, delayed
+
+
+def _adj_cache_path(data_dir: str, kind: str) -> str:
+    """返回市场特定的复权因子缓存路径"""
+    return os.path.join(data_dir, f"ptrade_adj_{kind}.parquet")
 
 
 def _calculate_adj_factors_from_events(stock, stock_df, exrights_events):
@@ -160,17 +164,17 @@ def create_adj_pre_cache(data_context):
             else:
                 failed_stocks.append(stock)
 
-        os.makedirs(os.path.dirname(ADJ_PRE_CACHE_PATH), exist_ok=True)
-        _adj_cache_to_parquet(adj_factors_cache, ADJ_PRE_CACHE_PATH)
+        cache_path = _adj_cache_path(data_dir, "pre")
+        _adj_cache_to_parquet(adj_factors_cache, cache_path)
 
-        file_size = os.path.getsize(ADJ_PRE_CACHE_PATH) / 1024 / 1024
+        file_size = os.path.getsize(cache_path) / 1024 / 1024
 
         logger.info("✓ 前复权因子缓存创建完成！")
         logger.info(f"  处理: {total_stocks} 只股票")
         logger.info(f"  保存: {saved_count} 只（有除权数据或价格数据）")
         if failed_stocks:
             logger.warning(f"  失败股票: {len(failed_stocks)} 只")
-        logger.info(f"  文件: {ADJ_PRE_CACHE_PATH} ({file_size:.1f}MB)")
+        logger.info(f"  文件: {cache_path} ({file_size:.1f}MB)")
 
     except OSError as e:
         logger.error(f"创建前复权因子缓存失败: {e}")
@@ -191,7 +195,9 @@ def load_adj_pre_cache(data_context):
     import logging
     logger = logging.getLogger(__name__)
 
-    if not os.path.exists(ADJ_PRE_CACHE_PATH):
+    cache_path = _adj_cache_path(data_context.stock_data_dict.data_dir, "pre")
+
+    if not os.path.exists(cache_path):
         try:
             create_adj_pre_cache(data_context)
         except Exception as e:
@@ -201,7 +207,7 @@ def load_adj_pre_cache(data_context):
     logger.info("正在加载前复权因子缓存...")
 
     try:
-        adj_factors_cache = _parquet_to_adj_cache(ADJ_PRE_CACHE_PATH)
+        adj_factors_cache = _parquet_to_adj_cache(cache_path)
 
         if adj_factors_cache is None:
             raise FileNotFoundError("缓存文件为空")
@@ -210,13 +216,13 @@ def load_adj_pre_cache(data_context):
         return adj_factors_cache
 
     except FileNotFoundError:
-        logger.error(f"缓存文件不存在: {ADJ_PRE_CACHE_PATH}")
+        logger.error(f"缓存文件不存在: {cache_path}")
         create_adj_pre_cache(data_context)
         return load_adj_pre_cache(data_context)
     except Exception as e:
         logger.error(f"缓存文件损坏或格式错误: {e}")
         try:
-            os.remove(ADJ_PRE_CACHE_PATH)
+            os.remove(cache_path)
             logger.info("已删除损坏的缓存文件，重新创建...")
             create_adj_pre_cache(data_context)
             return load_adj_pre_cache(data_context)
@@ -325,17 +331,17 @@ def create_adj_post_cache(data_context):
             else:
                 failed_stocks.append(stock)
 
-        os.makedirs(os.path.dirname(ADJ_POST_CACHE_PATH), exist_ok=True)
-        _adj_cache_to_parquet(adj_factors_cache, ADJ_POST_CACHE_PATH)
+        cache_path = _adj_cache_path(data_dir, "post")
+        _adj_cache_to_parquet(adj_factors_cache, cache_path)
 
-        file_size = os.path.getsize(ADJ_POST_CACHE_PATH) / 1024 / 1024
+        file_size = os.path.getsize(cache_path) / 1024 / 1024
 
         logger.info("✓ 后复权因子缓存创建完成！")
         logger.info(f"  处理: {total_stocks} 只股票")
         logger.info(f"  保存: {saved_count} 只（有除权数据或价格数据）")
         if failed_stocks:
             logger.warning(f"  失败股票: {len(failed_stocks)} 只")
-        logger.info(f"  文件: {ADJ_POST_CACHE_PATH} ({file_size:.1f}MB)")
+        logger.info(f"  文件: {cache_path} ({file_size:.1f}MB)")
 
     except OSError as e:
         logger.error(f"创建后复权因子缓存失败: {e}")
@@ -356,7 +362,9 @@ def load_adj_post_cache(data_context):
     import logging
     logger = logging.getLogger(__name__)
 
-    if not os.path.exists(ADJ_POST_CACHE_PATH):
+    cache_path = _adj_cache_path(data_context.stock_data_dict.data_dir, "post")
+
+    if not os.path.exists(cache_path):
         try:
             create_adj_post_cache(data_context)
         except Exception as e:
@@ -366,7 +374,7 @@ def load_adj_post_cache(data_context):
     logger.info("正在加载后复权因子缓存...")
 
     try:
-        adj_factors_cache = _parquet_to_adj_cache(ADJ_POST_CACHE_PATH)
+        adj_factors_cache = _parquet_to_adj_cache(cache_path)
 
         if adj_factors_cache is None:
             raise FileNotFoundError("缓存文件为空")
@@ -375,13 +383,13 @@ def load_adj_post_cache(data_context):
         return adj_factors_cache
 
     except FileNotFoundError:
-        logger.error(f"缓存文件不存在: {ADJ_POST_CACHE_PATH}")
+        logger.error(f"缓存文件不存在: {cache_path}")
         create_adj_post_cache(data_context)
         return load_adj_post_cache(data_context)
     except Exception as e:
         logger.error(f"缓存文件损坏或格式错误: {e}")
         try:
-            os.remove(ADJ_POST_CACHE_PATH)
+            os.remove(cache_path)
             logger.info("已删除损坏的缓存文件，重新创建...")
             create_adj_post_cache(data_context)
             return load_adj_post_cache(data_context)

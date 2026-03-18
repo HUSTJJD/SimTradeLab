@@ -78,8 +78,4 @@ def __getattr__(name: str) -> Path:
         return get_data_path()
     if name == 'STRATEGIES_PATH':
         return get_strategies_path()
-    if name == 'ADJ_PRE_CACHE_PATH':
-        return get_data_path() / 'ptrade_adj_pre.parquet'
-    if name == 'ADJ_POST_CACHE_PATH':
-        return get_data_path() / 'ptrade_adj_post.parquet'
     raise AttributeError(f"module 'paths' has no attribute {name!r}")

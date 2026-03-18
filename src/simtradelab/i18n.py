@@ -9,6 +9,7 @@ simtradelab i18n — 线程安全的翻译模块
 """
 
 import json
+import sys
 import threading
 from pathlib import Path
 
@@ -18,7 +19,8 @@ _DEFAULT_LOCALE = "zh"
 
 
 def _load_locales() -> None:
-    locales_dir = Path(__file__).parent / "locales"
+    base = getattr(sys, "_MEIPASS", None)
+    locales_dir = Path(base) / "simtradelab" / "locales" if base else Path(__file__).parent / "locales"
     for path in locales_dir.glob("*.json"):
         with open(path, "r", encoding="utf-8") as f:
             _locales[path.stem] = json.load(f)
