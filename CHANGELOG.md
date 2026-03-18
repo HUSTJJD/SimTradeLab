@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🐛 Fixed
 
-- **i18n** — PyInstaller 打包后 `Path(__file__)` 解析失败，改用 `sys._MEIPASS` 兼容
-- **adj_cache** — 复权因子缓存文件写入 `data/` 根目录而非市场子目录（`data/cn/`、`data/us/`）
+- **i18n** — Fix `Path(__file__)` resolution failure after PyInstaller packaging, use `sys._MEIPASS` for compatibility
+- **adj_cache** — Fix adjustment factor cache files written to `data/` root instead of market subdirectory (`data/cn/`, `data/us/`)
 
 ### 📦 Upgrade
 
