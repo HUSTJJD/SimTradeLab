@@ -23,7 +23,7 @@ from .context import Context
 from simtradelab.i18n import t
 
 # 策略代码禁止导入的模块（与Ptrade平台一致）
-_current_backtest_date: str | None = None
+_current_backtest_date: Optional[str] = None
 
 _BLOCKED_MODULES = frozenset({
     'os', 'sys', 'io', 'subprocess', 'shutil', 'socket', 'http', 'urllib',
@@ -33,10 +33,17 @@ _BLOCKED_MODULES = frozenset({
 _REAL_IMPORT = builtins.__import__
 
 
+import types
+
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     top = name.split('.')[0]
     if top in _BLOCKED_MODULES:
         raise ImportError(f"Module '{name}' is not allowed in strategy code")
+    if top == 'ptrade':
+        # ptrade 是虚拟模块，API 已通过 namespace 注入
+        mod = types.ModuleType('ptrade')
+        mod.__all__ = []
+        return mod
     return _REAL_IMPORT(name, globals, locals, fromlist, level)
 
 
