@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import calendar
 import json
+from pathlib import Path
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable
@@ -425,6 +426,11 @@ class PtradeAPI:
         p = get_strategies_path().parent / "research"
         p.mkdir(parents=True, exist_ok=True)
         return str(p) + "/"
+
+    def create_dir(self, path: str) -> None:
+        """创建目录（如果不存在）"""
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
 
     def get_Ashares(self, date: str | None = None) -> list[str]:
         """返回A股代码列表，支持历史查询"""

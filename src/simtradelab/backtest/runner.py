@@ -17,6 +17,7 @@ import pandas as pd
 import signal
 import logging
 import os
+from typing import Optional
 
 from simtradelab.i18n import set_locale, t
 from simtradelab.ptrade.context import Context
@@ -58,7 +59,7 @@ class BacktestRunner:
         self.trade_days = None
 
         # 优化模式：跨 trial 共享日期索引缓存
-        self._shared_date_index: dict | None = None
+        self._shared_date_index: Optional[dict] = None
 
         # 注册信号处理（仅在主线程）
         try:
