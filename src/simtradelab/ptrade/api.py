@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import calendar
 import json
+from pathlib import Path
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable
@@ -296,6 +297,11 @@ class PtradeAPI:
         p = get_strategies_path().parent / "research"
         p.mkdir(parents=True, exist_ok=True)
         return str(p) + "/"
+
+    def create_dir(self, path: str) -> None:
+        """创建目录（如果不存在）"""
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
 
     def get_Ashares(self, date: str = None) -> list[str]:
         """返回A股代码列表，支持历史查询"""
@@ -734,7 +740,7 @@ class PtradeAPI:
                     result[stock] = self._apply_adj_factors(stock_df, stock, fq)
 
         if not result:
-            self.log.warning(t("api.get_price_empty", stocks=security, frequency=frequency, fq=fq))
+            # self.log.warning(t("api.get_price_empty", stocks=security, frequency=frequency, fq=fq))
             return pd.DataFrame()
 
         if is_single_stock:
@@ -1023,7 +1029,7 @@ class PtradeAPI:
 
         return result
 
-    def get_stock_name(self, stocks: str | list[str]) -> str | dict[str, str]:
+    def get_stock_name(self, stocks: str | list[str]) -> dict[str, str]:
         """获取股票名称"""
         is_single = isinstance(stocks, str)
         if is_single:
@@ -1036,7 +1042,7 @@ class PtradeAPI:
             else:
                 result[stock] = stock
 
-        return result[stocks[0]] if is_single else result
+        return result
 
     def get_stock_status(
         self, stocks: str | list[str], query_type: str = "ST", query_date: str = None
