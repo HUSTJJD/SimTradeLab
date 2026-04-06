@@ -1413,7 +1413,7 @@ class PtradeAPI:
 
         # 转换为返回格式并缓存
         if not result:
-            self.log.warning(t("api.get_history_empty", stocks=security_list, count=count, frequency=frequency, fq=fq))
+            # self.log.warning(t("api.get_history_empty", stocks=security_list, count=count, frequency=frequency, fq=fq))
             final_result = {} if is_dict else pd.DataFrame()
         elif is_dict:
             # 兼容历史测试契约：{stock: {field: ndarray}}
