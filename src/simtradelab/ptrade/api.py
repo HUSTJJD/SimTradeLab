@@ -1932,10 +1932,10 @@ class PtradeAPI:
             self.context.blotter.all_orders.append(order)
 
         if amount > 0:
-            self.log.info(t("api.order_buy", order_id=order_id, stock=security, amount=amount))
+            # self.log.info(t("api.order_buy", order_id=order_id, stock=security, amount=amount))
             success = self.order_processor.execute_buy(security, amount, price)
         else:
-            self.log.info(t("api.order_sell", order_id=order_id, stock=security, amount=abs(amount)))
+            # self.log.info(t("api.order_sell", order_id=order_id, stock=security, amount=abs(amount)))
             success = self.order_processor.execute_sell(security, abs(amount), price)
 
         if success:
