@@ -652,7 +652,7 @@ class Portfolio:
 
 class Position:
     """模拟持仓对象"""
-    def __init__(self, stock: str, amount: float, cost_basis: float, t_plus_1: bool = True):
+    def __init__(self, stock: str, amount: float, cost_basis: float, t_plus_1: bool = False):
         self.stock = stock
         self.sid = stock  # 别名，保持兼容
         self.amount = amount
@@ -662,5 +662,4 @@ class Position:
         self.today_amount = 0
         self.business_type = 'STOCK'
         self.market_value = amount * cost_basis
-
 

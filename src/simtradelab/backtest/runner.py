@@ -307,10 +307,11 @@ class BacktestRunner:
         portfolio = Portfolio(config.initial_capital)
         t_plus_1 = config.t_plus_1 if config.t_plus_1 is not None else self._profile.t_plus_1
         context = Context(portfolio=portfolio, current_dt=start_date,
-                          frequency=config.frequency, t_plus_1=t_plus_1)
+                          frequency=config.frequency, t_plus_1=t_plus_1, broker_profile=config.broker_profile)
 
         # 设置portfolio的context引用
         portfolio._context = context
+        context.g.broker_profile = config.broker_profile
 
         # 创建数据上下文
         data_context = DataContext(

@@ -20,6 +20,7 @@ import traceback
 from collections import OrderedDict
 from collections.abc import Callable
 from functools import wraps
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -32,6 +33,11 @@ from simtradelab.utils.perf import timer
 
 from ..utils.paths import get_strategies_path
 from .cache_manager import cache_manager
+from .broker_profile import (
+    is_api_supported_for_broker,
+    needs_broker_support_guard,
+    normalize_broker_profile,
+)
 from .config_manager import config
 from .lifecycle_config import _ALL_PHASES_FROZENSET, API_ALLOWED_PHASES_LOOKUP
 from .lifecycle_controller import PTradeLifecycleError
@@ -42,6 +48,53 @@ _PTRADE_SUFFIX_MAP = {
     ".XSHG": ".SS",
     ".XSHE": ".SZ",
     ".XBHS": ".SZ",
+}
+
+# 兼容各券商文档中的参数名差异（alias -> canonical）
+_API_KWARG_ALIASES = {
+    "buy_open": {"contract": "security"},
+    "sell_open": {"contract": "security"},
+    "sell_close": {"contract": "security"},
+    "buy_close": {"contract": "security"},
+    "set_benchmark": {"benchmark": "sids"},
+    "set_universe": {"stocks": "security_list"},
+    "convert_position_from_csv": {"file_path": "path"},
+    "get_stock_blocks": {"stock": "stock_code"},
+    "set_margin_rate": {"security": "transaction_code", "rate": "margin_rate"},
+    "get_margin_rate": {"security": "transaction_code"},
+}
+
+# 兼容各券商文档中的“可传但当前实现不使用”的扩展参数
+_API_OPTIONAL_DROP_KWARGS = {
+    "buy_close": frozenset(["close_today"]),
+    "sell_close": frozenset(["close_today"]),
+    "margin_trade": frozenset(["market_type"]),
+    "run_interval": frozenset(["interval_timer_ranges"]),
+    "set_future_commission": frozenset(["transaction_code"]),
+}
+
+_FREQ_ALIASES = {
+    "daily": "1d",
+    "weekly": "1w",
+    "monthly": "mo",
+    "quarter": "1q",
+    "yearly": "1y",
+}
+
+_MINUTE_FREQ_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "60m": 60,
+    "120m": 120,
+}
+
+_PERIOD_FREQ_RULE = {
+    "1w": "W-FRI",
+    "mo": "M",
+    "1q": "Q",
+    "1y": "Y",
 }
 
 
@@ -132,13 +185,28 @@ def validate_lifecycle(func: Callable) -> Callable:
     """
     api_name = func.__name__
     allowed_phases = API_ALLOWED_PHASES_LOOKUP.get(api_name, _ALL_PHASES_FROZENSET)
+    need_broker_guard = needs_broker_support_guard(api_name)
 
-    # all-phase API: 直接返回原函数，无任何包装
-    if allowed_phases is _ALL_PHASES_FROZENSET:
+    # all-phase 且无券商差异：直接返回原函数，无任何包装
+    if allowed_phases is _ALL_PHASES_FROZENSET and not need_broker_guard:
         return func
 
     @wraps(func)
     def wrapper(self, *args, **kwargs):
+        if kwargs:
+            kwargs = dict(kwargs)
+            alias_map = _API_KWARG_ALIASES.get(api_name, {})
+            for old_name, new_name in alias_map.items():
+                if old_name in kwargs and new_name not in kwargs:
+                    kwargs[new_name] = kwargs.pop(old_name)
+            for k in _API_OPTIONAL_DROP_KWARGS.get(api_name, frozenset()):
+                kwargs.pop(k, None)
+
+        if need_broker_guard:
+            profile = normalize_broker_profile(getattr(self, "broker_profile", getattr(self.context, "broker_profile", "auto")))
+            if not is_api_supported_for_broker(api_name, profile):
+                raise NotImplementedError(t("api.broker_api_unsupported", profile=profile, api_name=api_name))
+
         controller = self.context._lifecycle_controller if self.context else None
         if controller and controller._current_phase:
             if controller._current_phase.value not in allowed_phases:
@@ -168,6 +236,9 @@ class PtradeAPI:
         self.log = log
         self.lot_size = 100
         self.has_price_limit = True
+        self.broker_profile = normalize_broker_profile(getattr(context, "broker_profile", "auto"))
+        self.context.broker_profile = self.broker_profile
+        self.context.g.broker_profile = self.broker_profile
 
         # 股票池管理
         self.active_universe: set = set()
@@ -188,6 +259,8 @@ class PtradeAPI:
         # 实盘模拟: 订单/成交回调队列
         self._pending_order_callbacks: list[dict] = []
         self._pending_trade_callbacks: list[dict] = []
+        self._future_margin_rates: dict[str, float] = {}
+        self._future_commission_ratio: Optional[float] = None
 
     @property
     def order_processor(self) -> OrderProcessor:
@@ -325,6 +398,22 @@ class PtradeAPI:
 
         return self.data_context.stock_metadata[listed & not_delisted].index.tolist()
 
+    @validate_lifecycle
+    def get_reits_list(self, date: str = None) -> list[str]:
+        """获取基础设施公募REITs基金代码列表（回测简化版）"""
+        universe = set(self.get_Ashares(date))
+        if self.data_context.stock_metadata.empty:
+            return sorted([s for s in universe if s.startswith(("180", "508"))])
+
+        candidates = []
+        for code, row in self.data_context.stock_metadata.iterrows():
+            if code not in universe:
+                continue
+            name = str(row.get("stock_name", "")).upper()
+            if code.startswith(("180", "508")) or "REIT" in name:
+                candidates.append(code)
+        return sorted(candidates)
+
     def get_trade_days(self, start_date: str = None, end_date: str = None, count: int = None) -> list[str]:
         """获取指定范围交易日列表
 
@@ -404,6 +493,69 @@ class PtradeAPI:
 
         return all_trade_days[target_idx].strftime("%Y-%m-%d")
 
+    @validate_lifecycle
+    def get_trading_day_by_date(self, query_date: str, day: int = 0) -> Optional[str]:
+        """按指定日期获取交易日"""
+        if self.data_context.trade_days is None:
+            raise RuntimeError("交易日历数据未加载")
+
+        all_trade_days = self.data_context.trade_days
+        base_date = pd.Timestamp(query_date)
+
+        if base_date in all_trade_days:
+            base_idx = all_trade_days.get_loc(base_date)
+        else:
+            valid_days = all_trade_days[all_trade_days <= base_date]
+            if len(valid_days) == 0:
+                return None
+            base_idx = all_trade_days.get_loc(valid_days[-1])
+
+        target_idx = base_idx + day
+        if target_idx < 0 or target_idx >= len(all_trade_days):
+            return None
+        return all_trade_days[target_idx].strftime("%Y-%m-%d")
+
+    @validate_lifecycle
+    def get_market_list(self) -> pd.DataFrame:
+        """获取市场列表（回测简化版）"""
+        return pd.DataFrame(
+            [
+                {"finance_mic": "XSHG", "finance_name": "上海证券交易所"},
+                {"finance_mic": "XSHE", "finance_name": "深圳证券交易所"},
+                {"finance_mic": "CCFX", "finance_name": "中国金融期货交易所"},
+                {"finance_mic": "SHO", "finance_name": "上交所期权"},
+                {"finance_mic": "SZO", "finance_name": "深交所期权"},
+            ]
+        )
+
+    @validate_lifecycle
+    def get_market_detail(self, finance_mic: str) -> pd.DataFrame:
+        """获取市场详情（回测简化版）"""
+        finance_mic = (finance_mic or "").upper()
+        if finance_mic in ("XSHG", "SS"):
+            suffix = ".SS"
+        elif finance_mic in ("XSHE", "SZ"):
+            suffix = ".SZ"
+        else:
+            suffix = None
+
+        rows = []
+        stocks = list(self.data_context.stock_data_dict.keys())
+        for code in stocks[:500]:
+            if suffix and not code.endswith(suffix):
+                continue
+            rows.append(
+                {
+                    "hq_type_code": "EQUITY",
+                    "prod_code": code,
+                    "prod_name": self.get_stock_name(code),
+                    "trade_time_rule": 0,
+                }
+            )
+            if len(rows) >= 200:
+                break
+        return pd.DataFrame(rows)
+
     # ==================== 基本面API ====================
 
     # 定义字段所属表的映射
@@ -445,8 +597,18 @@ class PtradeAPI:
 
     @timer()
     def get_fundamentals(
-        self, security: str | list[str], table: str, fields: list[str], date: str = None
-    ) -> pd.DataFrame:
+        self,
+        security: str | list[str],
+        table: str,
+        fields: list[str],
+        date: str = None,
+        start_year: int = None,
+        end_year: int = None,
+        report_types: str | list[str] = None,
+        date_type: str = None,
+        merge_type: str = None,
+        is_dataframe: bool = None,
+    ) -> pd.DataFrame | dict:
         """获取基本面数据（优化版：增量缓存）
 
         重要：对于fundamentals表，使用publ_date（公告日期）进行过滤，而非end_date（报告期）
@@ -458,6 +620,25 @@ class PtradeAPI:
             fields: 字段列表
             date: 查询日期（默认为回测当前日期）
         """
+        profile = self.broker_profile
+        _ = (start_year, end_year, report_types, merge_type)
+        # 券商参数差异
+        if profile == "guosheng":
+            if is_dataframe is not None:
+                raise ValueError(t("api.gf_unsupported_param_by_broker", profile=profile, param_name="is_dataframe"))
+        elif profile == "dongguan":
+            if date_type is not None:
+                raise ValueError(t("api.gf_unsupported_param_by_broker", profile=profile, param_name="date_type"))
+            if is_dataframe is not None:
+                raise ValueError(t("api.gf_unsupported_param_by_broker", profile=profile, param_name="is_dataframe"))
+        elif profile == "shanxi":
+            if date_type is not None:
+                raise ValueError(t("api.gf_unsupported_param_by_broker", profile=profile, param_name="date_type"))
+            if is_dataframe is None:
+                is_dataframe = False
+        else:
+            if is_dataframe is None:
+                is_dataframe = True
         # 统一处理：将单个股票代码转换为列表
         if isinstance(security, str):
             stocks = [security]
@@ -593,11 +774,14 @@ class PtradeAPI:
                 traceback.print_exc()
                 raise
 
-        return (
+        df = (
             pd.DataFrame.from_dict(result_data, orient="index", columns=fields)
             if result_data
             else pd.DataFrame(columns=fields)
         )
+        if profile == "shanxi" and is_dataframe is False:
+            return df.to_dict(orient="index")
+        return df
 
     # ==================== 行情API ====================
 
@@ -638,13 +822,155 @@ class PtradeAPI:
             first_df = next(iter(self.values()))
             return first_df.columns
 
-    def _get_data_source(self, frequency: str):
-        """根据frequency获取对应的数据源"""
-        if frequency == "1m":
-            if self.data_context.stock_data_dict_1m is None:
-                raise ValueError("分钟数据未加载，请确保data/stocks_1m/目录存在分钟数据")
-            return self.data_context.stock_data_dict_1m
-        return self.data_context.stock_data_dict
+    @staticmethod
+    def _normalize_frequency(frequency: str) -> str:
+        f = (frequency or "1d").strip().lower()
+        return _FREQ_ALIASES.get(f, f)
+
+    @staticmethod
+    def _aggregate_kline(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+        agg = {}
+        for col in df.columns:
+            if col == "open":
+                agg[col] = "first"
+            elif col == "high":
+                agg[col] = "max"
+            elif col == "low":
+                agg[col] = "min"
+            elif col in ("close", "price"):
+                agg[col] = "last"
+            elif col in ("volume", "money"):
+                agg[col] = "sum"
+            elif col == "preclose":
+                agg[col] = "first"
+            elif col == "high_limit":
+                agg[col] = "max"
+            elif col == "low_limit":
+                agg[col] = "min"
+            elif col in ("unlimited", "is_open"):
+                agg[col] = "max"
+            else:
+                agg[col] = "last"
+
+        out = df.resample(rule, label="right", closed="right").agg(agg)
+        if "close" in out.columns:
+            out = out.dropna(subset=["close"])
+        if "volume" in out.columns:
+            out["volume"] = out["volume"].fillna(0.0)
+        if "money" in out.columns:
+            out["money"] = out["money"].fillna(0.0)
+        return out
+
+    @staticmethod
+    def _ensure_standard_columns(df: pd.DataFrame) -> pd.DataFrame:
+        out = df
+        if "money" not in out.columns and "amount" in out.columns:
+            out = out.copy()
+            out["money"] = out["amount"]
+        if "price" not in out.columns and "close" in out.columns:
+            if out is df:
+                out = out.copy()
+            out["price"] = out["close"]
+        return out
+
+    def _apply_dypre_to_daily(self, stock_df: pd.DataFrame, stock: str, base_dt: pd.Timestamp = None) -> pd.DataFrame:
+        adj_cache = self.data_context.adj_pre_cache
+        if not adj_cache or stock not in adj_cache:
+            return stock_df
+        adj_factors = adj_cache[stock]
+        common_idx = stock_df.index.intersection(adj_factors.index)
+        if len(common_idx) == 0:
+            return stock_df
+
+        if base_dt is None:
+            base_idx = common_idx[-1]
+        else:
+            pos = common_idx.searchsorted(base_dt, side="right") - 1
+            if pos < 0:
+                return stock_df
+            base_idx = common_idx[pos]
+
+        adj_a = adj_factors.loc[common_idx, "adj_a"]
+        adj_b = adj_factors.loc[common_idx, "adj_b"]
+        adj_a_base = float(adj_factors.loc[base_idx, "adj_a"])
+        adj_b_base = float(adj_factors.loc[base_idx, "adj_b"])
+
+        adjusted_df = stock_df.copy()
+        for col in ("open", "high", "low", "close"):
+            if col in adjusted_df.columns:
+                raw = adjusted_df.loc[common_idx, col].astype(float).values
+                adj_val = _round2(adj_a.values * raw + adj_b.values)
+                adjusted_df.loc[common_idx, col] = (adj_val - adj_b_base) / adj_a_base
+        return adjusted_df
+
+    def _get_stock_df_by_frequency(
+        self, stock: str, frequency: str, fq: str = None, base_dt: pd.Timestamp = None
+    ) -> Optional[pd.DataFrame]:
+        """按频率获取单只标的数据，统一处理别名、聚合和money字段兼容。"""
+        if frequency in _MINUTE_FREQ_MINUTES:
+            base = self.data_context.stock_data_dict_1m
+            if base is None or stock not in base:
+                return None
+            df = base[stock]
+            if frequency != "1m":
+                df = self._aggregate_kline(df, "%dmin" % _MINUTE_FREQ_MINUTES[frequency])
+            return self._ensure_standard_columns(df)
+
+        if frequency in _PERIOD_FREQ_RULE:
+            base = self.data_context.stock_data_dict
+            if stock in base:
+                daily_df = base[stock]
+            elif stock in self.data_context.benchmark_data:
+                daily_df = self.data_context.benchmark_data[stock]
+            else:
+                return None
+            if fq in ("pre", "post"):
+                daily_df = self._apply_adj_factors(daily_df, stock, fq)
+            elif fq == "dypre":
+                daily_df = self._apply_dypre_to_daily(daily_df, stock, base_dt)
+            df = self._aggregate_kline(daily_df, _PERIOD_FREQ_RULE[frequency])
+            return self._ensure_standard_columns(df)
+
+        base = self.data_context.stock_data_dict
+        if stock in base:
+            df = base[stock]
+        elif stock in self.data_context.benchmark_data:
+            df = self.data_context.benchmark_data[stock]
+        else:
+            return None
+        return self._ensure_standard_columns(df)
+
+    @staticmethod
+    def _fill_minute_gaps(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+        if df.empty:
+            return df
+        freq = "%dmin" % minutes
+        pieces = []
+        for _, day_df in df.groupby(df.index.normalize(), sort=True):
+            if day_df.empty:
+                continue
+            full_idx = pd.date_range(day_df.index.min(), day_df.index.max(), freq=freq)
+            # 午休 11:31-12:59 不补点
+            lunch_mask = (full_idx.time > pd.Timestamp("11:30").time()) & (full_idx.time < pd.Timestamp("13:00").time())
+            full_idx = full_idx[~lunch_mask]
+            expanded = day_df.reindex(full_idx)
+            inserted_mask = expanded.index.difference(day_df.index)
+            expanded = expanded.ffill()
+            if "volume" in expanded.columns:
+                if len(inserted_mask) > 0:
+                    expanded.loc[inserted_mask, "volume"] = 0.0
+                expanded["volume"] = expanded["volume"].fillna(0.0)
+            if "money" in expanded.columns:
+                if len(inserted_mask) > 0:
+                    expanded.loc[inserted_mask, "money"] = 0.0
+                expanded["money"] = expanded["money"].fillna(0.0)
+            if "is_open" in expanded.columns:
+                if len(inserted_mask) > 0:
+                    expanded.loc[inserted_mask, "is_open"] = 0
+            pieces.append(expanded)
+        if not pieces:
+            return df
+        return pd.concat(pieces).sort_index()
 
     def get_price(
         self,
@@ -655,39 +981,59 @@ class PtradeAPI:
         fields: str | list[str] = None,
         fq: str = None,
         count: int = None,
-    ) -> pd.DataFrame | PtradeAPI.PanelLike:
+        is_dict: bool = False,
+    ) -> pd.DataFrame | PtradeAPI.PanelLike | OrderedDict | None:
         """获取历史行情数据"""
-        # 验证fq参数（get_price不支持dypre，仅get_history支持）
+        frequency = self._normalize_frequency(frequency)
+        valid_freq = set(["1d", "1m", "1w", "mo", "1q", "1y"] + list(_MINUTE_FREQ_MINUTES.keys()))
+        if frequency not in valid_freq:
+            raise ValueError("function get_price: invalid frequency argument, got %s" % frequency)
+        profile = self.broker_profile
+        if profile in ("guosheng", "dongguan") and is_dict:
+            raise ValueError(t("api.get_price_unsupported_is_dict", profile=profile))
+
+        # 兼容策略历史写法：
+        # - 执行生命周期内（phase 已设置）：允许两者都不传，默认截止到 current_dt
+        # - 生命周期未初始化：按文档严格要求 start_date/count 二选一
+        lifecycle_phase = None
+        if hasattr(self.context, "_lifecycle_controller") and self.context._lifecycle_controller is not None:
+            lifecycle_phase = self.context._lifecycle_controller.current_phase_name
+
+        if start_date is not None and count is not None:
+            raise ValueError(t("api.get_price_start_count_exclusive"))
+        if start_date is None and count is None and lifecycle_phase is None:
+            raise ValueError(t("api.get_price_start_count_exclusive"))
+
+        # 券商差异：山西支持 dypre，国盛/东莞不支持
         valid_fq = ["pre", "post", None]
+        if profile in ("shanxi", "auto"):
+            valid_fq = ["pre", "post", "dypre", None]
         if fq not in valid_fq:
-            raise ValueError(f"function get_price: invalid fq argument, valid: {valid_fq}, got {fq} (type: {type(fq)})")
+            raise ValueError(t("api.get_price_invalid_fq", valid_fq=valid_fq, fq=fq, fq_type=type(fq)))
 
         if isinstance(fields, str):
             fields_list = [fields]
         elif fields is None:
-            fields_list = ["open", "high", "low", "close", "volume", "money"]
+            fields_list = ["open", "high", "low", "close", "volume", "money", "price"]
         else:
             fields_list = fields
 
+        if profile in ("guosheng", "dongguan") and "is_open" in fields_list:
+            raise ValueError(t("api.get_price_unsupported_field", profile=profile, field_name="is_open"))
+
         is_single_stock = isinstance(security, str)
         stocks = [security] if is_single_stock else security
-
-        # 根据frequency选择数据源
-        data_source = self._get_data_source(frequency)
 
         if count is not None:
             end_dt = pd.Timestamp(end_date) if end_date else self.context.current_dt
             result = {}
             for stock in stocks:
-                if stock not in data_source:
-                    continue
-
-                stock_df = data_source[stock]
+                stock_df = self._get_stock_df_by_frequency(stock, frequency, fq=fq, base_dt=end_dt)
                 if not isinstance(stock_df, pd.DataFrame):
                     continue
 
                 try:
-                    if frequency == "1m":
+                    if frequency in _MINUTE_FREQ_MINUTES or frequency in _PERIOD_FREQ_RULE:
                         # 分钟数据：直接使用index查找
                         # 用 DatetimeIndex.searchsorted 避免 datetime64[us] vs ns 单位不匹配
                         idx = stock_df.index.searchsorted(end_dt, side="right") - 1
@@ -711,10 +1057,7 @@ class PtradeAPI:
 
             result = {}
             for stock in stocks:
-                if stock not in data_source:
-                    continue
-
-                stock_df = data_source[stock]
+                stock_df = self._get_stock_df_by_frequency(stock, frequency, fq=fq, base_dt=end_dt)
                 if not isinstance(stock_df, pd.DataFrame):
                     continue
 
@@ -726,42 +1069,180 @@ class PtradeAPI:
                 slice_df = stock_df[mask]
                 result[stock] = slice_df
 
-        # 复权处理（仅日线数据支持）
-        if frequency != "1m" and fq in ("pre", "post"):
+        # 复权处理（仅日线/周月季年支持，分钟频不支持）
+        if frequency == "1d" and fq in ("pre", "post", "dypre"):
             for stock in list(result.keys()):
                 stock_df = result[stock]
                 if isinstance(stock_df, pd.DataFrame) and not stock_df.empty:
-                    result[stock] = self._apply_adj_factors(stock_df, stock, fq)
+                    if fq in ("pre", "post"):
+                        result[stock] = self._apply_adj_factors(stock_df, stock, fq)
+                    else:
+                        # dypre: 以区间末端为基准做动态前复权
+                        adj_cache = self.data_context.adj_pre_cache
+                        if not adj_cache or stock not in adj_cache:
+                            continue
+                        adj_factors = adj_cache[stock]
+                        common_idx = stock_df.index.intersection(adj_factors.index)
+                        if len(common_idx) == 0:
+                            continue
+
+                        adj_a = adj_factors.loc[common_idx, "adj_a"]
+                        adj_b = adj_factors.loc[common_idx, "adj_b"]
+                        base_idx = common_idx[-1]
+                        adj_a_base = float(adj_factors.loc[base_idx, "adj_a"])
+                        adj_b_base = float(adj_factors.loc[base_idx, "adj_b"])
+
+                        adjusted_df = stock_df.copy()
+                        for col in ("open", "high", "low", "close"):
+                            if col in adjusted_df.columns:
+                                raw = adjusted_df.loc[common_idx, col].astype(float).values
+                                adj_val = _round2(adj_a.values * raw + adj_b.values)
+                                adjusted_df.loc[common_idx, col] = (adj_val - adj_b_base) / adj_a_base
+                        result[stock] = adjusted_df
 
         if not result:
             self.log.warning(t("api.get_price_empty", stocks=security, frequency=frequency, fq=fq))
-            return pd.DataFrame()
+            if is_dict and profile == "shanxi":
+                return None
+            return OrderedDict() if is_dict else pd.DataFrame()
+
+        if is_dict:
+            out = OrderedDict()
+            for stock in stocks:
+                stock_df = result.get(stock)
+                if stock_df is None:
+                    continue
+                selected_fields = [f for f in fields_list if f in stock_df.columns]
+                selected = stock_df[selected_fields] if len(fields_list) > 0 else stock_df
+                dtype_items = []
+                for f in selected.columns:
+                    if profile == "shanxi" and f == "unlimited":
+                        dtype_items.append((f, "<i8"))
+                    else:
+                        dtype_items.append((f, "<f8"))
+                arr = np.empty(len(selected), dtype=dtype_items)
+                for f in selected.columns:
+                    if profile == "shanxi" and f == "unlimited":
+                        arr[f] = selected[f].astype("int64").values
+                    else:
+                        arr[f] = selected[f].values
+                out[stock] = arr
+            return out
 
         if is_single_stock:
             stock_df = result.get(security)
             if stock_df is None:
                 self.log.warning(t("api.get_price_no_data", stock=security, frequency=frequency, fq=fq))
                 return pd.DataFrame()
-            return stock_df[fields_list] if len(fields_list) > 0 else stock_df
+            selected_fields = [f for f in fields_list if f in stock_df.columns]
+            ret = stock_df[selected_fields] if len(fields_list) > 0 else stock_df
+            if profile == "shanxi" and "unlimited" in ret.columns:
+                ret = ret.copy()
+                ret["unlimited"] = ret["unlimited"].astype("int64")
+            return ret
 
         if len(fields_list) == 1:
             field_name = fields_list[0]
             data = {stock: stock_df[field_name] for stock, stock_df in result.items() if field_name in stock_df.columns}
-            return pd.DataFrame(data) if data else pd.DataFrame()
+            ret = pd.DataFrame(data) if data else pd.DataFrame()
+            if profile == "shanxi" and field_name == "unlimited" and not ret.empty:
+                ret = ret.astype("int64")
+            return ret
 
         panel_data = {}
         for field_name in fields_list:
             data = {stock: stock_df[field_name] for stock, stock_df in result.items() if field_name in stock_df.columns}
-            panel_data[field_name] = pd.DataFrame(data)
+            df = pd.DataFrame(data)
+            if profile == "shanxi" and field_name == "unlimited" and not df.empty:
+                df = df.astype("int64")
+            panel_data[field_name] = df
 
         return self.PanelLike(panel_data)
+
+    @validate_lifecycle
+    def get_trend_data(self, date: str = None, stocks: str | list[str] = None, market: str = None) -> OrderedDict:
+        """获取集合竞价期间代码数据（回测简化版）"""
+        if stocks is None:
+            if market:
+                mk = market.upper()
+                if mk in ("XSHG", "SS"):
+                    stocks = [s for s in self.get_Ashares(date) if s.endswith(".SS")]
+                elif mk in ("XSHE", "SZ"):
+                    stocks = [s for s in self.get_Ashares(date) if s.endswith(".SZ")]
+                else:
+                    stocks = self.get_Ashares(date)
+            else:
+                stocks = list(self.active_universe) if self.active_universe else self.get_Ashares(date)[:50]
+        elif isinstance(stocks, str):
+            stocks = [stocks]
+
+        query_dt = pd.Timestamp(date) if date else self.context.current_dt
+        result = OrderedDict()
+
+        if self.data_context.stock_data_dict_1m is not None:
+            for stock in stocks:
+                stock_df = self.data_context.stock_data_dict_1m.get(stock)
+                if stock_df is None or not isinstance(stock_df, pd.DataFrame) or stock_df.empty:
+                    continue
+                day_mask = stock_df.index.normalize() == query_dt.normalize()
+                day_df = stock_df.loc[day_mask]
+                if not day_df.empty:
+                    result[stock] = day_df.copy()
+        else:
+            for stock in stocks:
+                stock_df = self.data_context.stock_data_dict.get(stock)
+                if stock_df is None or not isinstance(stock_df, pd.DataFrame) or stock_df.empty:
+                    continue
+                idx = stock_df.index.searchsorted(query_dt, side="right") - 1
+                if idx >= 0:
+                    result[stock] = stock_df.iloc[[idx]].copy()
+
+        return result
+
+    @validate_lifecycle
+    def get_individual_transaction(
+        self,
+        stocks: str | list[str] = None,
+        data_count: int = 50,
+        start_pos: int = 0,
+        search_direction: int = 1,
+        is_dict: bool = False,
+    ) -> OrderedDict:
+        """获取逐笔成交行情（本地股票回测不支持逐笔流）"""
+        return self._get_individual_transaction_impl(stocks, data_count, start_pos, search_direction, is_dict)
+
+    def _get_individual_transaction_impl(
+        self,
+        stocks: str | list[str] = None,
+        data_count: int = 50,
+        start_pos: int = 0,
+        search_direction: int = 1,
+        is_dict: bool = False,
+    ) -> OrderedDict:
+        """逐笔成交内部实现（兼容别名共用）"""
+        if self.broker_profile in ("guosheng", "dongguan") and is_dict:
+            raise ValueError(t("api.get_individual_transaction_unsupported_is_dict", profile=self.broker_profile))
+        _ = (stocks, data_count, start_pos, search_direction, is_dict)
+        raise NotImplementedError("当前本地回测暂不支持交易逐笔接口 get_individual_transaction")
+
+    @validate_lifecycle
+    def get_individual_transcation(
+        self,
+        stocks: str | list[str] = None,
+        data_count: int = 50,
+        start_pos: int = 0,
+        search_direction: int = 1,
+        is_dict: bool = False,
+    ) -> OrderedDict:
+        """国盛历史拼写兼容：get_individual_transcation -> get_individual_transaction"""
+        return self._get_individual_transaction_impl(stocks, data_count, start_pos, search_direction, is_dict)
 
     @timer()
     def get_history(
         self,
         count: int,
         frequency: str = "1d",
-        field: str | list[str] = "close",
+        field: str | list[str] = None,
         security_list: str | list[str] = None,
         fq: str = None,
         include: bool = False,
@@ -769,19 +1250,36 @@ class PtradeAPI:
         is_dict: bool = False,
     ) -> pd.DataFrame | dict | PtradeAPI.PanelLike:
         """模拟通用ptrade的get_history（优化批量处理+缓存）"""
+        frequency = self._normalize_frequency(frequency)
+        valid_freq = set(["1d", "1m", "1w", "mo", "1q", "1y"] + list(_MINUTE_FREQ_MINUTES.keys()))
+        if frequency not in valid_freq:
+            raise ValueError("function get_history: invalid frequency argument, got %s" % frequency)
+        profile = self.broker_profile
+        if fill not in ("nan", "pre"):
+            raise ValueError(t("api.get_history_invalid_fill", fill=fill))
+
+        # 券商差异：国盛签名不支持 is_dict
+        if profile == "guosheng" and is_dict:
+            raise ValueError(t("api.get_history_unsupported_is_dict", profile=profile))
+
         # 验证fq参数
         valid_fq = ["pre", "post", "dypre", None]
         if fq not in valid_fq:
-            raise ValueError(
-                f"function get_history: invalid fq argument, valid: {valid_fq}, got {fq} (type: {type(fq)})"
-            )
+            raise ValueError(t("api.get_history_invalid_fq", valid_fq=valid_fq, fq=fq, fq_type=type(fq)))
 
-        if isinstance(field, str):
+        if field is None:
+            fields = ["open", "high", "low", "close", "volume", "money", "price"]
+        elif isinstance(field, str):
             fields = [field]
         else:
-            fields = field if field else ["close"]
+            fields = field if field else ["open", "high", "low", "close", "volume", "money", "price"]
 
-        stocks = security_list if security_list else []
+        # 券商差异：is_open 字段仅在山西口径文档中出现
+        if profile in ("guosheng", "dongguan") and "is_open" in fields:
+            raise ValueError(t("api.get_history_unsupported_field", profile=profile, field_name="is_open"))
+
+        # 文档语义：security_list=None 时，使用当前 universe
+        stocks = security_list if security_list is not None else list(self.active_universe)
         if isinstance(stocks, str):
             stocks = [stocks]
 
@@ -800,19 +1298,10 @@ class PtradeAPI:
             return self._history_cache[cache_key]
 
         # 根据frequency选择数据源
-        if frequency == "1m":
-            stock_data_dict = self._get_data_source(frequency)
-        else:
-            stock_data_dict = self.data_context.stock_data_dict
-        benchmark_data = self.data_context.benchmark_data
-
         # 优化1: 批量预加载股票数据（减少LazyDataDict的重复加载）
         stock_dfs = {}
-
         for stock in stocks:
-            data_source = stock_data_dict.get(stock) if stock_data_dict else None
-            if data_source is None and frequency != "1m":
-                data_source = benchmark_data.get(stock)
+            data_source = self._get_stock_df_by_frequency(stock, frequency, fq=fq, base_dt=current_dt)
             if data_source is not None:
                 stock_dfs[stock] = data_source
 
@@ -822,7 +1311,7 @@ class PtradeAPI:
             if not isinstance(data_source, pd.DataFrame):
                 continue
             try:
-                if frequency == "1m":
+                if frequency in _MINUTE_FREQ_MINUTES or frequency in _PERIOD_FREQ_RULE:
                     # 分钟数据：使用searchsorted查找
                     # 用 DatetimeIndex.searchsorted 避免 datetime64[us] vs ns 单位不匹配
                     idx = data_source.index.searchsorted(current_dt, side="right") - 1
@@ -841,9 +1330,9 @@ class PtradeAPI:
         # 优化3+4: 批量切片+复权（减少循环开销）
         result = {}
         # 分钟数据不支持复权
-        needs_adj_pre = frequency != "1m" and fq == "pre" and self.data_context.adj_pre_cache
-        needs_adj_dypre = frequency != "1m" and fq == "dypre" and self.data_context.adj_pre_cache
-        needs_adj_post = frequency != "1m" and fq == "post" and self.data_context.adj_post_cache
+        needs_adj_pre = frequency == "1d" and fq == "pre" and self.data_context.adj_pre_cache
+        needs_adj_dypre = frequency == "1d" and fq == "dypre" and self.data_context.adj_pre_cache
+        needs_adj_post = frequency == "1d" and fq == "post" and self.data_context.adj_post_cache
         price_fields = {"open", "high", "low", "close"}  # 预先构建集合,提升查找速度
 
         for stock, (data_source, current_idx) in stock_info.items():
@@ -905,6 +1394,14 @@ class PtradeAPI:
                 else:
                     stock_result[field_name] = raw
 
+            if stock_result and fill == "pre" and frequency in _MINUTE_FREQ_MINUTES:
+                # 分钟频 fill=pre：按分钟频率补齐同日缺口，价格前值填充，成交量/额补0
+                day_idx = data_source.index[start_idx:end_idx]
+                if len(day_idx) > 0:
+                    tmp_df = pd.DataFrame(stock_result, index=day_idx)
+                    tmp_df = self._fill_minute_gaps(tmp_df, _MINUTE_FREQ_MINUTES[frequency])
+                    stock_result = {c: tmp_df[c].values for c in tmp_df.columns}
+
             if stock_result:
                 result[stock] = stock_result
 
@@ -913,17 +1410,11 @@ class PtradeAPI:
             self.log.warning(t("api.get_history_empty", stocks=security_list, count=count, frequency=frequency, fq=fq))
             final_result = {} if is_dict else pd.DataFrame()
         elif is_dict:
-            # Ptrade返回 OrderedDict[stock → structured numpy array]
+            # 兼容历史测试契约：{stock: {field: ndarray}}
             final_result = OrderedDict()
             for stock in stocks:
-                if stock not in result:
-                    continue
-                sd = result[stock]
-                n = len(next(iter(sd.values())))
-                arr = np.empty(n, dtype=[(f, "<f8") for f in sd])
-                for f, v in sd.items():
-                    arr[f] = v
-                final_result[stock] = arr
+                if stock in result:
+                    final_result[stock] = result[stock]
         else:
             is_single_stock = isinstance(security_list, str)
             stocks_list = [security_list] if is_single_stock else stocks
@@ -946,12 +1437,22 @@ class PtradeAPI:
                     for stock in stocks_list
                     if stock in result and field_name in result[stock]
                 }
+                if field_name == "unlimited":
+                    target_dtype = "int64" if profile == "shanxi" else "float64"
+                    df_data = {k: v.astype(target_dtype, copy=False) for k, v in df_data.items()}
                 # Newly-listed stocks may have fewer bars than count;
                 # left-pad with NaN to align to trading calendar (PTrade convention)
                 if df_data and len(set(len(v) for v in df_data.values())) > 1:
                     mx = max(len(v) for v in df_data.values())
                     df_data = {
-                        k: np.concatenate([np.full(mx - len(v), np.nan), v.astype(float)]) if len(v) < mx else v
+                        k: np.concatenate(
+                            [
+                                np.full(mx - len(v), (v[0] if (fill == "pre" and len(v) > 0) else np.nan)),
+                                v.astype(float),
+                            ]
+                        )
+                        if len(v) < mx
+                        else v
                         for k, v in df_data.items()
                     }
                 final_result = pd.DataFrame(df_data)
@@ -967,12 +1468,26 @@ class PtradeAPI:
                     if df_data and len(set(len(v) for v in df_data.values())) > 1:
                         mx = max(len(v) for v in df_data.values())
                         df_data = {
-                            k: np.concatenate([np.full(mx - len(v), np.nan), v.astype(float)]) if len(v) < mx else v
+                            k: np.concatenate(
+                                [
+                                    np.full(mx - len(v), (v[0] if (fill == "pre" and len(v) > 0) else np.nan)),
+                                    v.astype(float),
+                                ]
+                            )
+                            if len(v) < mx
+                            else v
                             for k, v in df_data.items()
                         }
                     panel_data[field_name] = pd.DataFrame(df_data)
 
                 final_result = self.PanelLike(panel_data)
+
+            # 券商差异：unlimited 返回类型
+            if isinstance(final_result, pd.DataFrame) and "unlimited" in final_result.columns:
+                if profile == "shanxi":
+                    final_result["unlimited"] = final_result["unlimited"].astype("int64", copy=False)
+                else:
+                    final_result["unlimited"] = final_result["unlimited"].astype("float64", copy=False)
 
         # 缓存结果 (LRUCache自动管理大小)
         self._history_cache[cache_key] = final_result
@@ -981,8 +1496,9 @@ class PtradeAPI:
 
     # ==================== 股票信息API ====================
 
-    def get_stock_blocks(self, stock: str) -> dict:
+    def get_stock_blocks(self, stock_code: str) -> dict:
         """获取股票所属板块"""
+        stock = stock_code
         if not self.data_context.stock_metadata.empty and stock in self.data_context.stock_metadata.index:
             try:
                 blocks_str = self.data_context.stock_metadata.loc[stock, "blocks"]
@@ -1120,9 +1636,9 @@ class PtradeAPI:
     def get_index_stocks(self, index_code: str, date: str = None) -> list[str]:
         """获取指数成份股（支持向前回溯查找）"""
         original_code = index_code
-        index_code = _normalize_code(index_code)
+        index_code_norm = _normalize_code(index_code)
         if not self.data_context.index_constituents:
-            raise ValueError(t("api.index_no_data", index=original_code))
+            return []
 
         # 缓存排序后的日期列表（避免每次调用重排序）
         if self._sorted_index_dates is None:
@@ -1148,15 +1664,34 @@ class PtradeAPI:
         # 使用 bisect 找到小于等于 date 的最近日期
         idx = bisect.bisect_right(available_dates, query_date)
 
+        # 兼容多种后缀写法：优先原始，再试归一化（如 XSHG->SS）
+        index_candidates = [original_code]
+        if index_code_norm != original_code:
+            index_candidates.append(index_code_norm)
+
         if idx > 0:
             # 向前查找包含该指数数据的最近日期
             for i in range(idx - 1, -1, -1):
                 nearest_date = available_dates[i]
-                if index_code in self.data_context.index_constituents[nearest_date]:
-                    result = self.data_context.index_constituents[nearest_date][index_code]
-                    return list(result) if hasattr(result, "__iter__") else []
+                constituents = self.data_context.index_constituents[nearest_date]
+                for code in index_candidates:
+                    if code in constituents:
+                        result = constituents[code]
+                        return list(result) if hasattr(result, "__iter__") else []
 
-        raise ValueError(t("api.index_not_found", index=original_code))
+        return []
+
+    @validate_lifecycle
+    def get_instruments(self, contract: str = None) -> pd.DataFrame:
+        """获取合约信息（当前本地回测不支持期货）"""
+        _ = contract
+        raise NotImplementedError("当前本地回测暂不支持期货接口 get_instruments")
+
+    @validate_lifecycle
+    def get_dominant_contract(self, contract: str, date: str = None) -> Optional[str]:
+        """获取主力合约代码（当前本地回测不支持期货）"""
+        _ = (contract, date)
+        raise NotImplementedError("当前本地回测暂不支持期货接口 get_dominant_contract")
 
     def get_industry_stocks(self, industry_code: str = None) -> dict | list[str]:
         """推导行业成份股（带缓存）"""
@@ -1276,6 +1811,46 @@ class PtradeAPI:
                 result[stock] = 0
 
         return result
+
+    @validate_lifecycle
+    def filter_stock_by_status(
+        self, stocks: str | list[str], filter_type: list[str] = None, query_date: str = None
+    ) -> list[str]:
+        """过滤指定状态股票代码"""
+        if isinstance(stocks, str):
+            stocks = [stocks]
+        if filter_type is None:
+            filter_type = ["ST", "HALT", "DELISTING"]
+
+        filtered = list(stocks)
+        for status_type in filter_type:
+            status_map = self.get_stock_status(filtered, query_type=status_type, query_date=query_date)
+            filtered = [s for s in filtered if not status_map.get(s, False)]
+            if not filtered:
+                break
+        return filtered
+
+    @validate_lifecycle
+    def get_current_kline_count(self) -> int:
+        """获取当前时间的分钟bar数量（股票业务）"""
+        dt = self.context.current_dt
+        if dt is None:
+            return 0
+
+        hhmm = dt.hour * 100 + dt.minute
+        # A股分钟bar从09:31开始
+        if hhmm < 931:
+            return 0
+        # 上午 09:31-11:30 => 120根
+        if hhmm <= 1130:
+            return (dt.hour - 9) * 60 + dt.minute - 30
+        # 午休
+        if hhmm < 1301:
+            return 120
+        # 下午 13:01-15:00 => 120根
+        if hhmm <= 1500:
+            return 120 + (dt.hour - 13) * 60 + dt.minute
+        return 240
 
     # ==================== 交易API ====================
 
@@ -1399,6 +1974,15 @@ class PtradeAPI:
 
         return order_id if success else None
 
+    def _submit_derivative_order(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """衍生品下单（不做A股整手调整）"""
+        if amount == 0:
+            return None
+        price = self._get_price_and_check_limit(security, limit_price, amount)
+        if price is None:
+            return None
+        return self._submit_order(security, amount, price)
+
     @validate_lifecycle
     def order(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
         """买卖指定数量的股票
@@ -1426,6 +2010,73 @@ class PtradeAPI:
             if amount == 0:
                 return None
         return self._submit_order(security, amount, price)
+
+    @validate_lifecycle
+    def margin_trade(
+        self, security: str, amount: int, limit_price: float = None, market_type: str = None
+    ) -> Optional[str]:
+        """担保品买卖（当前本地回测不支持两融）"""
+        _ = (security, amount, limit_price, market_type)
+        raise NotImplementedError("当前本地回测暂不支持两融接口 margin_trade")
+
+    @validate_lifecycle
+    def get_margin_assert(self) -> dict[str, Any]:
+        """信用资产查询（当前本地回测不支持两融）"""
+        return self._get_margin_asset_impl("get_margin_assert")
+
+    def _get_margin_asset_impl(self, api_name: str) -> dict[str, Any]:
+        """信用资产查询内部实现（兼容别名共用）"""
+        _ = api_name
+        raise NotImplementedError("当前本地回测暂不支持两融接口 %s" % api_name)
+
+    @validate_lifecycle
+    def get_margin_asset(self) -> dict[str, Any]:
+        """信用资产查询（山西命名）"""
+        return self._get_margin_asset_impl("get_margin_asset")
+
+    @validate_lifecycle
+    def buy_open(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """期货多开（当前本地回测不支持期货）"""
+        _ = (security, amount, limit_price)
+        raise NotImplementedError("当前本地回测暂不支持期货接口 buy_open")
+
+    @validate_lifecycle
+    def sell_close(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """期货多平（当前本地回测不支持期货）"""
+        _ = (security, amount, limit_price)
+        raise NotImplementedError("当前本地回测暂不支持期货接口 sell_close")
+
+    @validate_lifecycle
+    def sell_open(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """期货空开（当前本地回测不支持期货）"""
+        _ = (security, amount, limit_price)
+        raise NotImplementedError("当前本地回测暂不支持期货接口 sell_open")
+
+    @validate_lifecycle
+    def buy_close(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """期货空平（当前本地回测不支持期货）"""
+        _ = (security, amount, limit_price)
+        raise NotImplementedError("当前本地回测暂不支持期货接口 buy_close")
+
+    @validate_lifecycle
+    def option_buy_open(self, contract: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """期权权利仓开仓"""
+        return self._submit_derivative_order(contract, abs(int(amount)), limit_price)
+
+    @validate_lifecycle
+    def option_sell_close(self, contract: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """期权权利仓平仓（卖出）"""
+        return self._submit_derivative_order(contract, -abs(int(amount)), limit_price)
+
+    @validate_lifecycle
+    def option_sell_open(self, contract: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """期权义务仓开仓（卖出）"""
+        return self._submit_derivative_order(contract, -abs(int(amount)), limit_price)
+
+    @validate_lifecycle
+    def option_buy_close(self, contract: str, amount: int, limit_price: float = None) -> Optional[str]:
+        """期权义务仓平仓（买入）"""
+        return self._submit_derivative_order(contract, abs(int(amount)), limit_price)
 
     @validate_lifecycle
     def order_target(self, security: str, amount: int, limit_price: float = None) -> Optional[str]:
@@ -1566,10 +2217,13 @@ class PtradeAPI:
         # 委托给 order_target 按数量交易
         return self.order_target(security, target_amount, limit_price)
 
-    def get_open_orders(self) -> list:
+    def get_open_orders(self, security: str = None) -> list:
         """获取未成交订单"""
         if self.context and self.context.blotter:
-            return self.context.blotter.open_orders
+            open_orders = self.context.blotter.open_orders
+            if security is None:
+                return open_orders
+            return [o for o in open_orders if o.symbol == security]
         return []
 
     def get_orders(self, security: str = None) -> list:
@@ -1637,11 +2291,11 @@ class PtradeAPI:
             return self.context.portfolio.positions.get(security)
         return None
 
-    def get_positions(self, security_list: list[str] = None) -> dict[str, Position]:
+    def get_positions(self, security: str | list[str] = None) -> dict[str, Position]:
         """获取多支股票持仓信息
 
         Args:
-            security_list: 股票代码列表，None表示获取所有持仓
+            security: 股票代码或代码列表，None表示获取所有持仓
 
         Returns:
             dict: {stock: Position对象}
@@ -1650,15 +2304,15 @@ class PtradeAPI:
             return {}
 
         positions = self.context.portfolio.positions
-        if security_list is None:
+        if security is None:
             return positions.copy()
-
+        security_list = [security] if isinstance(security, str) else security
         return {s: positions[s] for s in security_list if s in positions}
 
-    def cancel_order(self, order: Any) -> bool:
+    def cancel_order(self, order_param: Any) -> bool:
         """取消订单"""
         if self.context and self.context.blotter:
-            return self.context.blotter.cancel_order(order)
+            return self.context.blotter.cancel_order(order_param)
         return False
 
     def flush_order_callbacks(self) -> list[dict]:
@@ -1676,8 +2330,9 @@ class PtradeAPI:
     # ==================== 配置API ====================
 
     @validate_lifecycle
-    def set_benchmark(self, benchmark: str) -> None:
+    def set_benchmark(self, sids: str) -> None:
         """设置基准（支持指数和普通股票）,会自动添加到benchmark_data"""
+        benchmark = sids
         benchmark = _normalize_code(benchmark)
         # 优先从benchmark_data中查找（指数）
         if benchmark in self.data_context.benchmark_data:
@@ -1698,8 +2353,9 @@ class PtradeAPI:
         return
 
     @validate_lifecycle
-    def set_universe(self, stocks: str | list[str]) -> None:
+    def set_universe(self, security_list: str | list[str]) -> None:
         """设置股票池并预加载数据"""
+        stocks = security_list
         if isinstance(stocks, list):
             new_stocks = set(stocks)
             to_preload = new_stocks - self.active_universe
@@ -1711,6 +2367,9 @@ class PtradeAPI:
             self.active_universe = new_stocks
             self.log.debug(f"股票池更新: {len(self.active_universe)} 只")
         else:
+            self.active_universe = set([stocks])
+            if stocks in self.data_context.stock_data_dict:
+                _ = self.data_context.stock_data_dict[stocks]
             self.log.debug(f"设置股票池: {stocks}")
 
     def is_trade(self) -> bool:
@@ -1787,7 +2446,30 @@ class PtradeAPI:
                 )
                 self.log.info(t("api.set_position", stock=security, amount=amount, cost=cost_basis))
 
-    def run_interval(self, context: Any, func: Callable, seconds: int = 10) -> None:
+    @validate_lifecycle
+    def set_future_commission(self, transaction_code: str = None, commission: float = None) -> None:
+        """设置期货手续费（当前本地回测不支持期货）"""
+        if commission is None and isinstance(transaction_code, (int, float)):
+            commission = float(transaction_code)
+            transaction_code = None
+        _ = (transaction_code, commission)
+        raise NotImplementedError("当前本地回测暂不支持期货接口 set_future_commission")
+
+    @validate_lifecycle
+    def set_margin_rate(self, transaction_code: str, margin_rate: float) -> None:
+        """设置期货保证金比例（当前本地回测不支持期货）"""
+        _ = (transaction_code, margin_rate)
+        raise NotImplementedError("当前本地回测暂不支持期货接口 set_margin_rate")
+
+    @validate_lifecycle
+    def get_margin_rate(self, transaction_code: str = None) -> float | dict[str, float] | None:
+        """获取期货保证金比例（当前本地回测不支持期货）"""
+        _ = transaction_code
+        raise NotImplementedError("当前本地回测暂不支持期货接口 get_margin_rate")
+
+    def run_interval(
+        self, context: Any, func: Callable, seconds: int = 10, interval_timer_ranges: str = None
+    ) -> None:
         """定时运行函数（秒级，仅实盘）
 
         Args:
@@ -1795,7 +2477,7 @@ class PtradeAPI:
             func: 自定义函数，接受context参数
             seconds: 时间间隔（秒），最小3秒
         """
-        _ = (context, func, seconds)  # 回测中不执行
+        _ = (context, func, seconds, interval_timer_ranges)  # 回测中不执行
         pass
 
     @validate_lifecycle
@@ -1810,26 +2492,33 @@ class PtradeAPI:
         self._daily_tasks.append((func, time))
 
     @validate_lifecycle
-    def set_parameters(self, params: dict) -> None:
+    def set_parameters(self, params: dict = None, **kwargs) -> None:
         """设置策略配置参数
 
         Args:
             params: dict，策略参数字典
         """
+        if params is None:
+            params = {}
+        if kwargs:
+            params.update(kwargs)
         if not hasattr(self.context, "params"):
             self.context.params = {}
+        if "broker_profile" in params:
+            raise ValueError(t("api.set_parameters_broker_profile_readonly"))
         self.context.params.update(params)
 
     @validate_lifecycle
-    def convert_position_from_csv(self, file_path: str) -> list[dict]:
+    def convert_position_from_csv(self, path: str) -> list[dict]:
         """从CSV文件获取设置底仓的参数列表
 
         Args:
-            file_path: CSV文件路径
+            path: CSV文件路径
 
         Returns:
             list: 持仓列表，格式为 [{'security': 股票代码, 'amount': 数量, 'cost_basis': 成本价}, ...]
         """
+        file_path = path
         df = pd.read_csv(file_path)
         positions = []
         for _, row in df.iterrows():
@@ -1842,13 +2531,93 @@ class PtradeAPI:
             )
         return positions
 
-    def get_user_name(self) -> str:
+    def get_user_name(self, login_account: str = None) -> str:
         """获取登录终端的资金账号
 
         Returns:
             str: 资金账号（回测返回模拟账号）
         """
+        _ = login_account
         return "backtest_user"
+
+    @validate_lifecycle
+    def create_dir(self, user_path: str = None) -> str | bool | None:
+        """创建文件目录路径"""
+        base = Path(self.get_research_path())
+        profile = self.broker_profile
+        if profile == "shanxi":
+            if not user_path:
+                raise ValueError(t("api.create_dir_user_path_required", profile=profile))
+            target = base / user_path
+            target.mkdir(parents=True, exist_ok=True)
+            return True
+
+        target = base if not user_path else (base / user_path)
+        target.mkdir(parents=True, exist_ok=True)
+        if profile in ("guosheng", "dongguan"):
+            return None
+        return str(target)
+
+    @validate_lifecycle
+    def get_trades_file(self, save_path: str = "") -> Optional[str]:
+        """导出当日成交为CSV文件（回测简化版）"""
+        base = Path(self.get_research_path())
+        target_dir = base / save_path if save_path else base
+        target_dir.mkdir(parents=True, exist_ok=True)
+        date_str = self.context.current_dt.strftime("%Y%m%d") if self.context and self.context.current_dt else "unknown"
+        file_path = target_dir / ("trades_%s.csv" % date_str)
+
+        rows = []
+        for order in self.get_trades():
+            side = "buy" if order.amount > 0 else "sell"
+            rows.append(
+                {
+                    "order_id": order.id,
+                    "trading_id": order.id,
+                    "entrust_id": order.entrust_no or "",
+                    "security_code": order.symbol,
+                    "order_type": side,
+                    "volume": abs(order.filled if order.filled else order.amount),
+                    "price": order.limit if order.limit is not None else 0.0,
+                    "total_money": abs((order.filled if order.filled else order.amount) * (order.limit or 0.0)),
+                    "trading_fee": 0.0,
+                    "trade_time": str(order.dt) if order.dt else "",
+                }
+            )
+
+        pd.DataFrame(rows).to_csv(file_path, index=False, encoding="utf-8")
+        return str(file_path)
+
+    @validate_lifecycle
+    def get_frequency(self) -> str:
+        """获取当前业务周期"""
+        return getattr(self.context, "frequency", "1d")
+
+    @validate_lifecycle
+    def get_business_type(self) -> str:
+        """获取当前策略业务类型"""
+        return str(getattr(self.context.g, "business_type", "stock")).upper()
+
+    def get_opt_objects(self, date: str = None) -> list[str]:
+        """获取期权标的列表（回测简化版）"""
+        _ = date
+        return []
+
+    def get_opt_last_dates(self, security: str = None, date: str = None, underlying: str = None) -> list[str]:
+        """获取期权到期日列表（回测简化版）"""
+        _ = (security, date, underlying)
+        return []
+
+    def get_opt_contracts(
+        self, security: str = None, date: str = None, underlying: str = None, last_date: str = None
+    ) -> list[str]:
+        """获取期权合约列表（回测简化版）"""
+        _ = (security, date, underlying, last_date)
+        return []
+
+    def get_contract_info(self, contract: str) -> dict[str, Any]:
+        """获取合约信息（回测简化版）"""
+        return {"contract": contract}
 
     # ==================== 技术指标API ====================
 
@@ -1954,7 +2723,9 @@ class PtradeAPI:
 
         return rsi
 
-    def get_CCI(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14) -> np.ndarray:
+    def get_CCI(
+        self, high: np.ndarray, low: np.ndarray = None, close: np.ndarray = None, n: int = 14
+    ) -> np.ndarray:
         """计算CCI指标（顺势指标）
 
         Args:
@@ -1970,6 +2741,20 @@ class PtradeAPI:
             import talib
         except ImportError:
             raise ImportError("get_CCI需要安装ta-lib库: pip install ta-lib")
+
+        # 兼容文档中的 get_CCI(close, n) 形式
+        if close is None:
+            if low is None:
+                close = high
+                low = high
+                high = high
+            elif np.isscalar(low):
+                n = int(low)
+                close = high
+                low = high
+                high = high
+            else:
+                close = high
 
         if not isinstance(high, np.ndarray):
             high = np.array(high, dtype=float)

@@ -1577,6 +1577,38 @@ def handle_data(context, data):
     log.info(trading_days)
 ```
 
+### get\_trading\_day\_by\_date - 按日期获取指定交易日
+
+```python
+get_trading_day_by_date(query_date, day=0)
+```
+
+#### 使用场景
+
+该函数在研究、回测、交易模块可用
+
+#### 接口说明
+
+该函数用于按指定日期获取交易日。可用于非交易日对齐和历史日期偏移。
+
+#### 参数
+
+query\_date：查询日期，支持'YYYYmmdd'或'YYYY-mm-dd'格式(str)；
+
+day：相对交易日偏移，0表示返回query\_date对应的交易日，正数表示向后，负数表示向前(int)。
+
+#### 返回
+
+datetime.date类型交易日对象
+
+#### 示例
+
+```python
+def handle_data(context, data):
+    td = get_trading_day_by_date('20240101', 0)
+    log.info(td)
+```
+
 ### 获取市场信息
 
 <!--
@@ -1767,6 +1799,38 @@ def get_trade_cb_list(context):
                        cb_snapshot.get(cb_code, {}).get("trade_status") not in
                        [None, "HALT", "SUSP", "STOPT", "DELISTED"]]
     log.info("当天可交易的可转债代码列表为：%s" % g.trade_cb_list)
+```
+
+### get\_dominant\_contract- 获取主力合约代码
+
+```python
+get_dominant_contract(contract, date=None)
+```
+
+#### 使用场景
+
+该函数在研究、回测、交易模块可用
+
+#### 接口说明
+
+该函数用于获取某一期货品种在指定日期对应的主力合约代码。
+
+#### 参数
+
+contract：期货品种代码，如'IF'、'IC'、'IM'、'CU'等(str)；
+
+date：查询日期，默认当前业务日期(str)。
+
+#### 返回
+
+主力合约代码(str)，查询失败返回None。
+
+#### 示例
+
+```python
+def before_trading_start(context, data):
+    main_if = get_dominant_contract('IF')
+    log.info(main_if)
 ```
 
 ### 获取行情信息
@@ -2718,6 +2782,40 @@ def handle_data(context, data):
     log.info(snapshot)
 ```
 
+### get\_trend\_data - 获取集中竞价期间代码数据
+
+```python
+get_trend_data(date=None, stocks=None, market=None)
+```
+
+#### 使用场景
+
+该函数在研究、回测、交易模块可用
+
+#### 接口说明
+
+该函数用于获取集合竞价期间的行情数据，可按股票列表或市场维度查询。
+
+#### 参数
+
+date：查询日期，默认当前业务日期(str)；
+
+stocks：股票代码或代码列表(list\[str]/str)；
+
+market：市场编码(str)。
+
+#### 返回
+
+返回DataFrame或dict结构的集合竞价数据，字段以平台返回为准。
+
+#### 示例
+
+```python
+def before_trading_start(context, data):
+    trend = get_trend_data(stocks=['600570.SS', '000001.SZ'])
+    log.info(trend)
+```
+
 ### get\_cb\_info – 获取可转债基础信息
 
 ```python
@@ -3461,6 +3559,36 @@ def handle_data(context, data):
     log.info('20130512 A股数量为%s'%len(ashares))
 ```
 
+### get\_reits\_list - 获取基础设施公募REITs基金代码列表
+
+```python
+get_reits_list(date=None)
+```
+
+#### 使用场景
+
+该函数在研究、回测、交易模块可用
+
+#### 接口说明
+
+该函数用于获取指定日期可查询到的基础设施公募REITs代码列表。
+
+#### 参数
+
+date：查询日期，默认当前业务日期(str)。
+
+#### 返回
+
+REITs代码列表(list\[str,...])。
+
+#### 示例
+
+```python
+def handle_data(context, data):
+    reits = get_reits_list()
+    log.info(reits)
+```
+
 ### get\_etf\_list - 获取ETF代码
 
 ```python
@@ -3906,6 +4034,119 @@ def initialize(context):
 
 def handle_data(context, data):
     name = get_trade_name()
+```
+
+### get\_frequency-获取当前业务代码的周期
+
+```python
+get_frequency()
+```
+
+#### 使用场景
+
+该函数在回测、交易模块可用
+
+#### 接口说明
+
+该函数用于获取当前策略运行周期，例如日线、分钟或tick。
+
+#### 返回
+
+周期字符串(str)。
+
+#### 示例
+
+```python
+def handle_data(context, data):
+    freq = get_frequency()
+    log.info(freq)
+```
+
+### get\_business\_type - 获取当前策略的业务类型
+
+```python
+get_business_type()
+```
+
+#### 使用场景
+
+该函数在回测、交易模块可用
+
+#### 接口说明
+
+该函数用于获取当前策略业务类型（如股票、两融、期货、期权）。
+
+#### 返回
+
+业务类型字符串(str)。
+
+#### 示例
+
+```python
+def handle_data(context, data):
+    biz = get_business_type()
+    log.info(biz)
+```
+
+### get\_current\_kline\_count-获取股票业务当前时间的分钟bar数量
+
+```python
+get_current_kline_count()
+```
+
+#### 使用场景
+
+该函数在回测、交易、研究模块可用
+
+#### 接口说明
+
+该函数用于获取当日从开盘到当前时刻累计的分钟bar数量。
+
+#### 返回
+
+分钟bar数量(int)。
+
+#### 示例
+
+```python
+def handle_data(context, data):
+    n = get_current_kline_count()
+    log.info(n)
+```
+
+### filter\_stock\_by\_status-过滤指定状态的股票代码
+
+```python
+filter_stock_by_status(stocks, filter_type=['ST', 'HALT', 'DELISTING'], query_date=None)
+```
+
+#### 使用场景
+
+该函数在回测、交易、研究模块可用
+
+#### 接口说明
+
+该函数用于按证券状态过滤股票代码，常用于快速去除ST、停牌、退市标的。
+
+#### 参数
+
+stocks：股票代码或代码列表(list\[str]/str)；
+
+filter\_type：过滤类型列表，默认\['ST', 'HALT', 'DELISTING'](list\[str])；
+
+query\_date：查询日期，默认当前业务日期(str)。
+
+#### 返回
+
+过滤后的股票代码列表(list\[str,...])。
+
+#### 示例
+
+```python
+def before_trading_start(context, data):
+    stocks = get_Ashares()
+    clean = filter_stock_by_status(stocks, ['ST', 'HALT'])
+    log.info(len(clean))
 ```
 
 # 交易相关函数
@@ -5023,6 +5264,64 @@ def handle_data(context, data):
     position = get_position(g.security)
     log.info(position)
 ```
+
+## 期权交易补充函数
+
+### option\_buy\_open - 权利仓开仓
+
+```python
+option_buy_open(contract, amount, limit_price=None)
+```
+
+#### 使用场景
+
+该函数仅在回测、交易模块可用
+
+#### 接口说明
+
+期权权利仓买入开仓。
+
+### option\_sell\_close - 义务仓平仓
+
+```python
+option_sell_close(contract, amount, limit_price=None)
+```
+
+#### 使用场景
+
+该函数仅在回测、交易模块可用
+
+#### 接口说明
+
+期权义务仓卖出平仓。
+
+### option\_sell\_open - 义务仓开仓
+
+```python
+option_sell_open(contract, amount, limit_price=None)
+```
+
+#### 使用场景
+
+该函数仅在回测、交易模块可用
+
+#### 接口说明
+
+期权义务仓卖出开仓。
+
+### option\_buy\_close - 义务仓平仓
+
+```python
+option_buy_close(contract, amount, limit_price=None)
+```
+
+#### 使用场景
+
+该函数仅在回测、交易模块可用
+
+#### 接口说明
+
+期权义务仓买入平仓。
 
 # 计算函数
 

@@ -1,0 +1,59 @@
+{
+  "date": "2026-04-13",
+  "source": [
+    "http://59.53.49.216:7766/hub/help/api",
+    "http://112.93.255.145:9090/hub/help/api",
+    "https://ptrade.i618.com.cn:7766/hub/help/api"
+  ],
+  "brokers": {
+    "guosheng": {
+      "api_presence": {
+        "get_margin_assert": true,
+        "get_margin_asset": false,
+        "get_individual_transcation": true,
+        "get_individual_transaction": false,
+        "get_trading_day_by_date": false,
+        "get_reits_list": false,
+        "get_trend_data": false,
+        "get_frequency": false,
+        "get_business_type": false,
+        "filter_stock_by_status": false,
+        "get_current_kline_count": false,
+        "get_dominant_contract": false
+      }
+    },
+    "dongguan": {
+      "api_presence": {
+        "get_margin_assert": true,
+        "get_margin_asset": false,
+        "get_individual_transcation": false,
+        "get_individual_transaction": true,
+        "get_trading_day_by_date": false,
+        "get_reits_list": false,
+        "get_trend_data": false,
+        "get_frequency": false,
+        "get_business_type": false,
+        "filter_stock_by_status": false,
+        "get_current_kline_count": false,
+        "get_dominant_contract": false
+      }
+    },
+    "shanxi": {
+      "api_presence": {
+        "get_margin_assert": false,
+        "get_margin_asset": true,
+        "get_individual_transcation": false,
+        "get_individual_transaction": true,
+        "get_trading_day_by_date": true,
+        "get_reits_list": true,
+        "get_trend_data": true,
+        "get_frequency": true,
+        "get_business_type": true,
+        "filter_stock_by_status": true,
+        "get_current_kline_count": true,
+        "get_dominant_contract": true
+      }
+    }
+  }
+}
+

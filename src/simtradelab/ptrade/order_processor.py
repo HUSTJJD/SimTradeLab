@@ -137,9 +137,14 @@ class OrderProcessor:
     def check_limit_status(self, stock: str, delta: int, limit_status: int) -> bool:
         """检查涨跌停限制
 
-        Ptrade回测不阻止涨跌停交易，只靠volume=0（停牌）拒绝订单。
-        保留接口以兼容调用方。
+        涨停（1）禁止买入；跌停（-1）禁止卖出。
+        其余状态不限制。
         """
+        _ = stock
+        if limit_status == 1 and delta > 0:
+            return False
+        if limit_status == -1 and delta < 0:
+            return False
         return True
 
     def create_order(self, stock: str, amount: int, price: float) -> tuple[str, object]:

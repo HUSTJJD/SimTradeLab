@@ -83,6 +83,8 @@ API_LIFECYCLE_RESTRICTIONS: dict[str, list[str]] = {
     "get_margin_contract": _EXEC,
     "get_margin_contractreal": ["handle_data", "tick_data"],
     "get_margin_assert": _EXEC,
+    # 山西文档新命名兼容
+    "get_margin_asset": _EXEC,
     "get_assure_security_list": _EXEC,
     "get_margincash_open_amount": ["handle_data", "tick_data"],
     "get_margincash_close_amount": ["handle_data", "tick_data"],
@@ -97,6 +99,10 @@ API_LIFECYCLE_RESTRICTIONS: dict[str, list[str]] = {
     "sell_close": ["handle_data", "tick_data"],
     "sell_open": ["handle_data", "tick_data"],
     "buy_close": ["handle_data", "tick_data"],
+    "option_buy_open": ["handle_data", "tick_data"],
+    "option_sell_close": ["handle_data", "tick_data"],
+    "option_sell_open": ["handle_data", "tick_data"],
+    "option_buy_close": ["handle_data", "tick_data"],
     "get_margin_rate": ["all"],   # initialize文档列出：get_margin_rate(回测(期货))
     "get_instruments": _EXEC_CB,
     # ==========================================
@@ -119,16 +125,21 @@ API_LIFECYCLE_RESTRICTIONS: dict[str, list[str]] = {
     "get_trading_day": ["all"],
     "get_all_trades_days": ["all"],
     "get_trade_days": ["all"],
+    "get_trading_day_by_date": ["all"],
     # ==========================================
     # 行情/数据查询 - 不含initialize
     # ==========================================
     "get_market_list": _EXEC,
     "get_market_detail": _EXEC,
+    "get_dominant_contract": _EXEC,
     "get_cb_list": _EXEC_CB,
     "get_history": _EXEC,
-    "get_price": _EXEC,
+    "get_price": ["all"],
+    "get_trend_data": _EXEC,
     "get_individual_entrust": ["before_trading_start", "handle_data", "after_trading_end", "tick_data"],
     "get_individual_transaction": ["before_trading_start", "handle_data", "after_trading_end", "tick_data"],
+    # 国盛文档历史拼写兼容
+    "get_individual_transcation": ["before_trading_start", "handle_data", "after_trading_end", "tick_data"],
     "get_tick_direction": ["handle_data", "after_trading_end", "tick_data"],
     "get_sort_msg": ["before_trading_start", "handle_data", "after_trading_end", "tick_data"],
     "get_etf_info": _EXEC,
@@ -147,6 +158,7 @@ API_LIFECYCLE_RESTRICTIONS: dict[str, list[str]] = {
     "get_industry_stocks": _EXEC,
     "get_fundamentals": _EXEC,
     "get_Ashares": _EXEC,
+    "get_reits_list": _EXEC,
     "get_etf_list": _EXEC,
     "get_ipo_stocks": ["before_trading_start", "handle_data", "tick_data"],
     # 其他信息
@@ -169,6 +181,10 @@ API_LIFECYCLE_RESTRICTIONS: dict[str, list[str]] = {
     # ==========================================
     "log": ["all"],               # 日志，全阶段可用
     "is_trade": ["all"],          # initialize文档列出
+    "get_frequency": ["all"],
+    "get_business_type": ["all"],
+    "get_current_kline_count": _EXEC,
+    "filter_stock_by_status": _EXEC,
     "check_limit": _EXEC,
     "send_email": ["after_trading_end", "tick_data", "on_order_response", "on_trade_response"],
     "send_qywx": ["after_trading_end", "tick_data", "on_order_response", "on_trade_response"],

@@ -19,6 +19,7 @@ import pandas as pd
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from simtradelab.i18n import _DEFAULT_LOCALE
+from simtradelab.ptrade.broker_profile import normalize_broker_profile
 
 
 def _default_data_path():
@@ -63,6 +64,9 @@ class BacktestConfig(BaseModel):
     # 市场选择: CN=A股, US=美股
     market: str = Field(default="CN", description="市场代码")
 
+    # 券商API口径：auto/guosheng/dongguan/shanxi
+    broker_profile: str = Field(default="auto", description="券商API口径")
+
     # T+1 覆盖：None=使用市场默认（CN=True, US=False），显式值覆盖市场默认
     t_plus_1: Optional[bool] = None
 
@@ -95,6 +99,7 @@ class BacktestConfig(BaseModel):
             raise ValueError("start_date必须早于end_date")
         if self.locale is None:
             self.locale = "zh" if self.market == "CN" else _DEFAULT_LOCALE
+        self.broker_profile = normalize_broker_profile(self.broker_profile)
         return self
 
     @property

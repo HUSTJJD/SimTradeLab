@@ -1,0 +1,48 @@
+{
+  "date": "2026-04-13",
+  "apis": {
+    "get_history": {
+      "required_params": ["count"],
+      "optional_params": ["frequency", "field", "security_list", "fq", "include", "fill", "is_dict"],
+      "default_values": {
+        "frequency": "1d",
+        "field": null,
+        "security_list": null,
+        "fq": null,
+        "include": false,
+        "fill": "nan",
+        "is_dict": false
+      }
+    },
+    "get_price": {
+      "required_params": ["security"],
+      "optional_params": ["start_date", "end_date", "frequency", "fields", "fq", "count", "is_dict"],
+      "default_values": {
+        "start_date": null,
+        "end_date": null,
+        "frequency": "1d",
+        "fields": null,
+        "fq": null,
+        "count": null,
+        "is_dict": false
+      }
+    },
+    "get_fundamentals": {
+      "required_params": ["security", "table", "fields"],
+      "optional_params": ["date", "start_year", "end_year", "report_types", "date_type", "merge_type", "is_dataframe"]
+    },
+    "create_dir": {
+      "required_params": [],
+      "optional_params": ["user_path"],
+      "default_values": {
+        "user_path": null
+      }
+    },
+    "set_parameters": {
+      "required_params": [],
+      "optional_params": ["params"],
+      "must_have_var_keyword": true
+    }
+  }
+}
+

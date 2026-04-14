@@ -1,5 +1,17 @@
 # PTrade API 完整接口总结
 
+## 相比当前总结文档，新增的回测可用 API（9个）：
+  - `get_trading_day_by_date`
+  - `get_trend_data`
+  - `get_reits_list`
+  - `get_dominant_contract`
+  - `log`
+  - `get_frequency`
+  - `get_business_type`
+  - `get_current_kline_count`
+  - `filter_stock_by_status`
+- 说明：`option_*` 与 `get_opt_*` 相关接口目前在你当前官方页面可见内容中不可检索，已从“当前基线清单”移至“待确认接口”。
+
 ## 策略生命周期函数使用限制说明 📋
 
 本文档为每个API函数标注了它们只能在特定的策略生命周期函数中使用，标注格式为 `{函数名}`：
@@ -45,7 +57,7 @@
 - **set_volume_ratio(ratio)** - 设置成交比例 *[仅回测]* `{initialize}`
 - **set_limit_mode(mode)** - 设置回测成交数量限制模式 *[仅回测]* `{initialize}`
 - **set_yesterday_position(positions)** - 设置底仓 *[仅回测]* `{initialize}`
-- **set_parameters(params)** - 设置策略配置参数 *[回测/交易]* `{initialize}`
+- **set_parameters(params)** - 设置策略配置参数 *[仅交易]* `{initialize}`
 
 ### 定时函数
 - **run_daily(func, time)** - 按日周期处理 *[回测/交易]* `{initialize}`
@@ -53,7 +65,7 @@
 
 ### 期货设置
 - **set_future_commission(commission)** - 设置期货手续费 *[仅回测]* `{initialize}`
-- **set_margin_rate(security, rate)** - 设置期货保证金比例 *[回测/交易]* `{initialize}`
+- **set_margin_rate(security, rate)** - 设置期货保证金比例 *[仅回测]* `{initialize}`
 
 ## 获取信息函数 (50+个)
 
@@ -68,7 +80,7 @@
 - **get_cb_list()** - 获取可转债市场代码表 *[仅交易]* `{all}`
 
 ### 行情信息 (10个)
-- **get_history(count, frequency, field, security_list, fq, include, fill, is_dict, start_date, end_date)** - 获取历史行情 *[回测/交易]* `{all}`
+- **get_history(count, frequency, field, security_list, fq, include, fill, is_dict, start_date, end_date)** - 获取历史行情 *[研究/回测/交易]* `{all}`
 - **get_price(security, start_date, end_date, frequency, fields, count)** - 获取历史数据 *[研究/回测/交易]* `{all}`
 - **get_individual_entrust(security_list)** - 获取逐笔委托行情 *[仅交易]* `{tick_data}`
 - **get_individual_transaction(security_list)** - 获取逐笔成交行情 *[仅交易]* `{tick_data}`
@@ -78,7 +90,7 @@
 - **get_etf_stock_info(etf_code)** - 获取ETF成分券信息 *[仅交易]* `{all}`
 - **get_gear_price(security_list)** - 获取指定代码的档位行情价格 *[仅交易]* `{handle_data|tick_data}`
 - **get_snapshot(security_list)** - 获取行情快照 *[仅交易]* `{handle_data|tick_data}`
-- **get_cb_info(cb_code)** - 获取可转债基础信息 *[研究/交易]* `{all}`
+- **get_cb_info(cb_code)** - 获取可转债基础信息 *[仅交易]* `{all}`
 
 ### 股票信息 (12个)
 - **get_stock_name(security_list)** - 获取股票名称 *[研究/回测/交易]* `{all}`
@@ -134,26 +146,26 @@
 
 ### 融资融券交易类函数 (7个)
 - **margin_trade(security, amount, limit_price=None)** - 担保品买卖 *[两融回测/两融交易]* `{handle_data|tick_data}`
-- **margincash_open(security, amount, limit_price=None)** - 融资买入 *[仅两融交易]* `{handle_data|tick_data}`
-- **margincash_close(security, amount, limit_price=None)** - 卖券还款 *[仅两融交易]* `{handle_data|tick_data}`
-- **margincash_direct_refund(amount)** - 直接还款 *[仅两融交易]* `{handle_data|after_trading_end}`
-- **marginsec_open(security, amount, limit_price=None)** - 融券卖出 *[仅两融交易]* `{handle_data|tick_data}`
-- **marginsec_close(security, amount, limit_price=None)** - 买券还券 *[仅两融交易]* `{handle_data|tick_data}`
-- **marginsec_direct_refund(security, amount)** - 直接还券 *[仅两融交易]* `{handle_data|after_trading_end}`
+- **margincash_open(security, amount, limit_price=None)** - 融资买入 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **margincash_close(security, amount, limit_price=None)** - 卖券还款 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **margincash_direct_refund(amount)** - 直接还款 *[仅交易（两融账户）]* `{handle_data|after_trading_end}`
+- **marginsec_open(security, amount, limit_price=None)** - 融券卖出 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **marginsec_close(security, amount, limit_price=None)** - 买券还券 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **marginsec_direct_refund(security, amount)** - 直接还券 *[仅交易（两融账户）]* `{handle_data|after_trading_end}`
 
 ### 融资融券查询类函数 (12个)
-- **get_margincash_stocks()** - 获取融资标的列表 *[仅两融交易]* `{all}`
-- **get_marginsec_stocks()** - 获取融券标的列表 *[仅两融交易]* `{all}`
-- **get_margin_contract()** - 合约查询 *[仅两融交易]* `{all}`
-- **get_margin_contractreal()** - 实时合约查询 *[仅两融交易]* `{handle_data|tick_data}`
-- **get_margin_assert()** - 信用资产查询 *[仅两融交易]* `{all}`
-- **get_assure_security_list()** - 担保券查询 *[仅两融交易]* `{all}`
-- **get_margincash_open_amount(security)** - 融资标的最大可买数量查询 *[仅两融交易]* `{handle_data|tick_data}`
-- **get_margincash_close_amount(security)** - 卖券还款标的最大可卖数量查询 *[仅两融交易]* `{handle_data|tick_data}`
-- **get_marginsec_open_amount(security)** - 融券标的最大可卖数量查询 *[仅两融交易]* `{handle_data|tick_data}`
-- **get_marginsec_close_amount(security)** - 买券还券标的最大可买数量查询 *[仅两融交易]* `{handle_data|tick_data}`
-- **get_margin_entrans_amount(security)** - 现券还券数量查询 *[仅两融交易]* `{handle_data|tick_data}`
-- **get_enslo_security_info(security)** - 融券头寸信息查询 *[仅两融交易]* `{all}`
+- **get_margincash_stocks()** - 获取融资标的列表 *[仅交易（两融账户）]* `{all}`
+- **get_marginsec_stocks()** - 获取融券标的列表 *[仅交易（两融账户）]* `{all}`
+- **get_margin_contract()** - 合约查询 *[仅交易（两融账户）]* `{all}`
+- **get_margin_contractreal()** - 实时合约查询 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **get_margin_assert()** - 信用资产查询 *[仅交易（两融账户）]* `{all}`
+- **get_assure_security_list()** - 担保券查询 *[仅交易（两融账户）]* `{all}`
+- **get_margincash_open_amount(security)** - 融资标的最大可买数量查询 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **get_margincash_close_amount(security)** - 卖券还款标的最大可卖数量查询 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **get_marginsec_open_amount(security)** - 融券标的最大可卖数量查询 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **get_marginsec_close_amount(security)** - 买券还券标的最大可买数量查询 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **get_margin_entrans_amount(security)** - 现券还券数量查询 *[仅交易（两融账户）]* `{handle_data|tick_data}`
+- **get_enslo_security_info(security)** - 融券头寸信息查询 *[仅交易（两融账户）]* `{all}`
 
 ## 期货专用函数 (7个)
 
@@ -170,7 +182,7 @@
 ### 期货设置类函数 (1个)
 - **set_future_commission(commission)** - 设置期货手续费 *[仅回测]* `{initialize}`
 
-## 期权专用函数 (15个)
+## 期权专用函数（待确认，当前页面不可见） (15个)
 
 ### 期权查询类函数 (6个)
 - **get_opt_objects()** - 获取期权标的列表 *[研究/回测/交易]* `{all}`
@@ -181,10 +193,10 @@
 - **get_covered_unlock_amount(underlying)** - 获取期权标的允许备兑解锁数量 *[仅交易]* `{handle_data|tick_data}`
 
 ### 期权交易类函数 (7个)
-- **buy_open(security, amount, limit_price=None)** - 权利仓开仓 *[仅交易]* `{handle_data|tick_data}`
-- **sell_close(security, amount, limit_price=None)** - 权利仓平仓 *[仅交易]* `{handle_data|tick_data}`
-- **sell_open(security, amount, limit_price=None)** - 义务仓开仓 *[仅交易]* `{handle_data|tick_data}`
-- **buy_close(security, amount, limit_price=None)** - 义务仓平仓 *[仅交易]* `{handle_data|tick_data}`
+- **option_buy_open(security, amount, limit_price=None)** - 权利仓开仓 *[仅交易]* `{handle_data|tick_data}`
+- **option_sell_close(security, amount, limit_price=None)** - 权利仓平仓 *[仅交易]* `{handle_data|tick_data}`
+- **option_sell_open(security, amount, limit_price=None)** - 义务仓开仓 *[仅交易]* `{handle_data|tick_data}`
+- **option_buy_close(security, amount, limit_price=None)** - 义务仓平仓 *[仅交易]* `{handle_data|tick_data}`
 - **open_prepared(security, amount, limit_price=None)** - 备兑开仓 *[仅交易]* `{handle_data|tick_data}`
 - **close_prepared(security, amount, limit_price=None)** - 备兑平仓 *[仅交易]* `{handle_data|tick_data}`
 - **option_exercise(security, amount)** - 行权 *[仅交易]* `{handle_data|after_trading_end}`
@@ -210,7 +222,7 @@
 - **send_email(send_email_info, get_email_info, smtp_code, info, path, subject)** - 发送邮箱信息 *[仅交易]* `{after_trading_end|on_order_response|on_trade_response}`
 - **send_qywx(corp_id, secret, agent_id, info, path, toparty, touser, totag)** - 发送企业微信信息 *[仅交易]* `{after_trading_end|on_order_response|on_trade_response}`
 - **permission_test(account=None, end_date=None)** - 权限校验 *[仅交易]* `{initialize}`
-- **create_dir(user_path=None)** - 创建文件路径 *[仅交易]* `{initialize}`
+- **create_dir(user_path=None)** - 创建文件路径 *[研究/回测/交易]* `{initialize}`
 
 ## 对象定义 (11个核心对象)
 
