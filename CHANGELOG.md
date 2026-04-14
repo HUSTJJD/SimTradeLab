@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.2] - 2026-04-14
+
+### ✨ Added
+
+- **broker compatibility** — Add `broker_profile` support (`auto/guosheng/dongguan/shanxi`) in backtest config and runtime context for broker-specific API behavior.
+- **api coverage** — Add/complete multiple PTrade-compatible APIs and aliases, including:
+  - `get_trading_day_by_date`, `get_trend_data`, `get_reits_list`
+  - `get_frequency`, `get_business_type`, `get_current_kline_count`, `filter_stock_by_status`
+  - broker naming aliases: `get_margin_asset` / `get_margin_assert`, `get_individual_transcation` / `get_individual_transaction`
+- **snapshot guard** — Add broker API baseline snapshots and signature compatibility guard scripts.
+- **tests** — Add comprehensive unit test suite for API compatibility, lifecycle, order processor, object model, cache, and broker profile behavior.
+
+### 🔧 Changed
+
+- **market data API** — Refactor `get_price` / `get_history` with normalized frequency handling:
+  - support minute aggregations (`5m/15m/30m/60m/120m`)
+  - support period aggregations (`1w/mo/1q/1y`)
+  - add minute-gap fill behavior for `fill='pre'`
+  - align default history fields to include `price`
+- **release tooling** — Move release utilities from `scripts/` to `script/` and align release docs with the current CI auto-release workflow.
+- **docs** — Update PTrade API references, backtest support matrix, and broker compatibility docs.
+
+### 🐛 Fixed
+
+- **api contracts** — Fix multiple broker compatibility edge cases in API signatures/parameters and optional alias kwargs.
+- **order/position semantics** — Adjust T+1-related position and limit-check behavior to match expected test contracts.
+- **release guard path** — Fix API signature guard to read source from `src/simtradelab/ptrade/api.py`.
+
+### 📦 Upgrade
+
+```bash
+pip install --upgrade simtradelab==2.10.2
+```
+
+---
+
 ## [2.10.1] - 2026-03-26
 
 ### 🐛 Fixed

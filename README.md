@@ -21,13 +21,13 @@ English | [中文](README.zh-CN.md) | [Deutsch](README.de.md)
 |---|---|---|
 | Speed | **100–160x faster** | Baseline |
 | Startup | Sub-second (data persists in memory) | Minutes |
-| API Coverage | 46 backtest/research APIs | Full platform |
+| API Coverage | 62 backtest/research APIs | Full platform |
 | Strategy Porting | Zero code changes | Zero code changes |
 | Environment | Local, free, open-source | Cloud, licensed |
 
 **Core capabilities:**
 
-- ✅ **46 APIs** — 100% coverage of stock backtesting scenarios (daily & minute bars)
+- ✅ **62 APIs** — 100% coverage of stock backtesting scenarios (daily & minute bars)
 - ⚡ **100–160x faster** than PTrade platform
 - 🚀 **In-memory data persistence** — singleton pattern, sub-second startup after first load
 - 💾 **Multi-level caching** — LRU caches for MA/VWAP/adjustment factors/history, >95% hit rate
@@ -85,6 +85,7 @@ config = BacktestConfig(
     # --- Capital & Market ---
     # initial_capital=100000.0,        # Starting capital (must be > 0)
     # market='CN',                     # Market: 'CN' (A-shares) | 'US'
+    # broker_profile='auto',           # Broker API profile: 'auto' | 'guosheng' | 'dongguan' | 'shanxi'
     # t_plus_1=None,                   # T+1 override: None=market default (CN=True, US=False)
     # benchmark_code='',               # Benchmark code, empty=market default
 
@@ -108,6 +109,7 @@ config = BacktestConfig(
     # --- Sandbox & i18n ---
     # sandbox=True,                    # PTrade sandbox: restrict imports & builtins
     # locale='auto',                   # Log language: 'zh' | 'en' | 'de' (auto: CN market→zh, else system locale)
+    # optimization_mode=False,         # Optimization mode: skip strategy validation/data analysis/logging setup
 
     # --- Entry file ---
     # strategy_file='backtest.py',     # Entry file: 'backtest.py' | 'live.py'
@@ -120,7 +122,7 @@ report = runner.run(config=config)
 
 ## 📚 API Overview
 
-46 backtest/research APIs — 100% stock backtesting coverage.
+62 backtest/research APIs — 100% stock backtesting coverage.
 
 | Category | APIs |
 |----------|------|

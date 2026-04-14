@@ -21,13 +21,13 @@
 |---|---|---|
 | 速度 | **快100–160倍** | 基准 |
 | 启动 | 亚秒级（数据常驻内存） | 分钟级 |
-| API覆盖 | 46个回测/研究API | 全平台 |
+| API覆盖 | 62个回测/研究API | 全平台 |
 | 策略迁移 | 零代码修改 | 零代码修改 |
 | 运行环境 | 本地、免费、开源 | 云端、授权 |
 
 **核心能力：**
 
-- ✅ **46个API** — 股票日/分钟线回测场景100%覆盖
+- ✅ **62个API** — 股票日/分钟线回测场景100%覆盖
 - ⚡ **100-160倍性能提升** — 本地回测比PTrade平台快100-160倍
 - 🚀 **数据常驻内存** — 单例模式，首次加载后常驻，二次运行秒级启动
 - 💾 **多级智能缓存** — LRU缓存（MA/VWAP/复权/历史数据），命中率>95%
@@ -85,6 +85,7 @@ config = BacktestConfig(
     # --- 资金与市场 ---
     # initial_capital=100000.0,        # 初始资金（必须 > 0）
     # market='CN',                     # 市场: 'CN'(A股) | 'US'(美股)
+    # broker_profile='auto',           # 券商API口径: 'auto' | 'guosheng' | 'dongguan' | 'shanxi'
     # t_plus_1=None,                   # T+1覆盖: None=市场默认(CN=True, US=False)
     # benchmark_code='',               # 基准代码，空串=市场默认基准
 
@@ -108,6 +109,7 @@ config = BacktestConfig(
     # --- 沙箱与国际化 ---
     # sandbox=True,                    # PTrade沙箱模式: 限制import和内置函数
     # locale='auto',                   # 日志语言: 'zh' | 'en' | 'de'（自动：CN市场→zh，其他→系统语言）
+    # optimization_mode=False,         # 优化模式: 跳过策略校验/数据分析/日志配置（由优化器管理）
 
     # --- 入口文件 ---
     # strategy_file='backtest.py',     # 入口文件: 'backtest.py' | 'live.py'
@@ -120,7 +122,7 @@ report = runner.run(config=config)
 
 ## 📚 API 概览
 
-46个回测/研究API — 股票回测场景100%覆盖。
+62个回测/研究API — 股票回测场景100%覆盖。
 
 | 类别 | API |
 |------|-----|
