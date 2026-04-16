@@ -39,9 +39,9 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     top = name.split('.')[0]
     if top in _BLOCKED_MODULES:
         raise ImportError(f"Module '{name}' is not allowed in strategy code")
-    if top == 'ptrade':
-        # ptrade 是虚拟模块，API 已通过 namespace 注入
-        mod = types.ModuleType('ptrade')
+    if name == 'PTrade.api' or top == 'PTrade':
+        # PTrade.api 是虚拟模块，API 已通过 namespace 注入
+        mod = types.ModuleType('PTrade.api')
         mod.__all__ = []
         return mod
     return _REAL_IMPORT(name, globals, locals, fromlist, level)
