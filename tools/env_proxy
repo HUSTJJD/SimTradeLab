@@ -1,0 +1,25 @@
+#!/bin/bash
+
+case $1 in
+ 
+on)
+export HTTP_PROXY="http://"$2
+export HTTPS_PROXY="http://"$2
+export http_proxy="http://"$2
+export https_proxy="http://"$2
+;;
+
+off)
+unset HTTP_PROXY
+unset HTTPS_PROXY
+unset http_proxy
+unset https_proxy
+;;
+ 
+status)
+echo $HTTP_PROXY
+echo $HTTPS_PROXY
+echo $http_proxy
+echo $https_proxy
+;;
+esac
