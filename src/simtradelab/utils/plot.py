@@ -9,6 +9,11 @@ def save_figure(fig, path, dpi=150, close=True, **kwargs):
     必须在 tight_layout() 之后调用。
     """
     import matplotlib.pyplot as plt
+    
+    # 设置字体 - 使用系统可用的中文字体
+    plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'Noto Sans CJK SC']
+    plt.rcParams['axes.unicode_minus'] = False
+    
     fig.text(
         0.99, 0.99, 'SimTradeLab',
         fontsize=10, color='gray', alpha=0.15,
