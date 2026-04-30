@@ -386,13 +386,13 @@ class PtradeAPI:
         if self.data_context.stock_metadata.empty:
             return list(self.data_context.stock_data_dict.keys())
 
-        # 使用预解析的 Timestamp 列（避免每次调用都解析日期字符串）
-        if self.data_context.listed_date_ts is not None:
+        # 检查 data_context 是否有预解析的 Timestamp 列
+        if hasattr(self.data_context, 'listed_date_ts') and self.data_context.listed_date_ts is not None:
             listed = self.data_context.listed_date_ts <= target_date
         else:
             listed = pd.to_datetime(self.data_context.stock_metadata["listed_date"], format="mixed") <= target_date
 
-        if self.data_context.de_listed_date_ts is not None:
+        if hasattr(self.data_context, 'de_listed_date_ts') and self.data_context.de_listed_date_ts is not None:
             not_delisted = (self.data_context.stock_metadata["de_listed_date"] == "2900-01-01") | (
                 self.data_context.de_listed_date_ts > target_date
             )
@@ -567,6 +567,8 @@ class PtradeAPI:
     # 定义字段所属表的映射
     FUNDAMENTAL_TABLES = {
         "valuation": ["pe_ttm", "pb", "ps_ttm", "pcf", "total_value", "float_value"],
+        'income': ['operating_revenue', 'operating_cost', 'finance_expense', 'operating_profit', 
+                   'total_profit', 'net_profit', 'np_parent_company', 'basic_eps', 'publ_date'],
         "profit_ability": [
             "roe",
             "roa",

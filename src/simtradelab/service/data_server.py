@@ -254,7 +254,7 @@ class DataServer:
             from ..ptrade.config_manager import config
             self.fundamentals_dict = LazyDataDict(
                 self.data_path, 'fundamentals', self._fundamentals_keys_cache,
-                preload=False,
+                preload=True,
                 max_cache_size=config.cache.fundamentals_cache_size
             )
         else:
