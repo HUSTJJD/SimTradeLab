@@ -69,7 +69,8 @@ class TradingConfig(BaseModel):
         description="印花税率（千分之一，卖出时收取）"
     )
 
-    model_config = {"frozen": True}  # 配置不可变，确保线程安全
+    class Config:
+        allow_mutation = False  # 配置不可变，确保线程安全
 
 
 class CacheConfig(BaseModel):
@@ -105,7 +106,8 @@ class CacheConfig(BaseModel):
         description="历史数据缓存大小（单股票粒度，约10000只×25天×8字节≈2MB）"
     )
 
-    model_config = {"frozen": True}
+    class Config:
+        allow_mutation = False
 
 
 class PerformanceConfig(BaseModel):
@@ -128,7 +130,8 @@ class PerformanceConfig(BaseModel):
         description="是否预加载所有股票"
     )
 
-    model_config = {"frozen": True}
+    class Config:
+        allow_mutation = False
 
 
 class ConfigurationManager:
@@ -159,15 +162,15 @@ class ConfigurationManager:
 
         自动验证参数有效性。配置不可变，创建新实例。
         """
-        self.trading = TradingConfig(**{**self.trading.model_dump(), **kwargs})
+        self.trading = TradingConfig(**{**self.trading.dict(), **kwargs})
 
     def update_cache_config(self, **kwargs) -> None:
         """更新缓存配置"""
-        self.cache = CacheConfig(**{**self.cache.model_dump(), **kwargs})
+        self.cache = CacheConfig(**{**self.cache.dict(), **kwargs})
 
     def update_performance_config(self, **kwargs) -> None:
         """更新性能配置"""
-        self.performance = PerformanceConfig(**{**self.performance.model_dump(), **kwargs})
+        self.performance = PerformanceConfig(**{**self.performance.dict(), **kwargs})
 
     def reset_to_defaults(self) -> None:
         """重置为默认配置"""
@@ -191,25 +194,25 @@ class ConfigurationManager:
     def export_config(self) -> dict[str, Any]:
         """导出所有配置为字典
 
-        使用pydantic的model_dump方法
+        使用pydantic的dict方法
         """
         return {
-            'trading': self.trading.model_dump(),
-            'cache': self.cache.model_dump(),
-            'performance': self.performance.model_dump(),
+            'trading': self.trading.dict(),
+            'cache': self.cache.dict(),
+            'performance': self.performance.dict(),
         }
 
     def load_config(self, config_dict: dict[str, Any]) -> None:
         """从字典加载配置
 
-        使用pydantic的model_validate方法
+        使用pydantic的parse_obj方法
         """
         if 'trading' in config_dict:
-            self.trading = TradingConfig.model_validate(config_dict['trading'])
+            self.trading = TradingConfig.parse_obj(config_dict['trading'])
         if 'cache' in config_dict:
-            self.cache = CacheConfig.model_validate(config_dict['cache'])
+            self.cache = CacheConfig.parse_obj(config_dict['cache'])
         if 'performance' in config_dict:
-            self.performance = PerformanceConfig.model_validate(config_dict['performance'])
+            self.performance = PerformanceConfig.parse_obj(config_dict['performance'])
 
 
 # 全局单例实例

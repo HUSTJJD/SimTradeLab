@@ -467,7 +467,8 @@ class Order(BaseModel):
     priceGear: Optional[int] = Field(default=None, description="盘口档位")
     status: str = Field(default='0', description="订单状态：'0'未报, '1'待报, '2'已报")
 
-    model_config = {"arbitrary_types_allowed": True}
+    class Config:
+        arbitrary_types_allowed = True
 
     @property
     def created(self) -> Optional[datetime]:
