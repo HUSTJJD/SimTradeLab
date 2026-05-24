@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import calendar
 import json
+from pathlib import Path
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable
@@ -426,6 +427,11 @@ class PtradeAPI:
         p.mkdir(parents=True, exist_ok=True)
         return str(p) + "/"
 
+    def create_dir(self, path: str) -> None:
+        """创建目录（如果不存在）"""
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+
     def get_Ashares(self, date: str | None = None) -> list[str]:
         """返回A股代码列表，支持历史查询"""
         if date is None:
@@ -436,13 +442,13 @@ class PtradeAPI:
         if self.data_context.stock_metadata.empty:
             return list(self.data_context.stock_data_dict.keys())
 
-        # 使用预解析的 Timestamp 列（避免每次调用都解析日期字符串）
-        if self.data_context.listed_date_ts is not None:
+        # 检查 data_context 是否有预解析的 Timestamp 列
+        if hasattr(self.data_context, 'listed_date_ts') and self.data_context.listed_date_ts is not None:
             listed = self.data_context.listed_date_ts <= target_date
         else:
             listed = pd.to_datetime(self.data_context.stock_metadata["listed_date"], format="mixed") <= target_date
 
-        if self.data_context.de_listed_date_ts is not None:
+        if hasattr(self.data_context, 'de_listed_date_ts') and self.data_context.de_listed_date_ts is not None:
             not_delisted = (self.data_context.stock_metadata["de_listed_date"] == "2900-01-01") | (
                 self.data_context.de_listed_date_ts > target_date
             )
@@ -1647,7 +1653,7 @@ class PtradeAPI:
 
         # ── 转换为返回格式（与 ptrade 对齐）──
         if not result:
-            self.log.warning(t("api.get_history_empty", stocks=security_list, count=count, frequency=frequency, fq=fq))
+            # self.log.warning(t("api.get_history_empty", stocks=security_list, count=count, frequency=frequency, fq=fq))
             final_result = {} if is_dict else pd.DataFrame()
         elif is_dict:
             # 兼容历史测试契约：{stock: {field: ndarray}}
@@ -2234,10 +2240,10 @@ class PtradeAPI:
             self.context.blotter.all_orders.append(order)
 
         if amount > 0:
-            self.log.info(t("api.order_buy", order_id=order_id, stock=security, amount=amount))
+            # self.log.info(t("api.order_buy", order_id=order_id, stock=security, amount=amount))
             success = self.order_processor.execute_buy(security, amount, price)
         else:
-            self.log.info(t("api.order_sell", order_id=order_id, stock=security, amount=abs(amount)))
+            # self.log.info(t("api.order_sell", order_id=order_id, stock=security, amount=abs(amount)))
             success = self.order_processor.execute_sell(security, abs(amount), price)
 
         if success:

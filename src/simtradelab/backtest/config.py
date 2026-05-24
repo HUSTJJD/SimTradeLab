@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import pandas as pd
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, validator, root_validator
 
 from simtradelab.i18n import _DEFAULT_LOCALE
 from simtradelab.ptrade.broker_profile import normalize_broker_profile
@@ -76,9 +76,10 @@ class BacktestConfig(BaseModel):
     # 策略文件名（默认 backtest.py，实盘模拟用 live.py）
     strategy_file: str = 'backtest.py'
 
-    model_config = {"arbitrary_types_allowed": True}
+    class Config:
+        arbitrary_types_allowed = True
 
-    @field_validator('start_date', 'end_date', mode='before')
+    @validator('start_date', 'end_date', pre=True)
     @classmethod
     def convert_to_timestamp(cls, v) -> pd.Timestamp:
         """转换日期为pd.Timestamp"""
@@ -86,18 +87,18 @@ class BacktestConfig(BaseModel):
             return v
         return pd.Timestamp(v)
 
-    @model_validator(mode='after')
-    def validate_date_range(self):
+    @root_validator
+    def validate_date_range(cls, values):
         """验证日期范围
 
         此时start_date和end_date已被field_validator转换为pd.Timestamp
         """
-        if self.start_date >= self.end_date:  # type: ignore
+        if values.get('start_date') >= values.get('end_date'):  # type: ignore
             raise ValueError("start_date必须早于end_date")
-        if self.locale is None:
-            self.locale = "zh" if self.market == "CN" else _DEFAULT_LOCALE
-        self.broker_profile = normalize_broker_profile(self.broker_profile)
-        return self
+        if values.get('locale') is None:
+            values['locale'] = "zh" if values.get('market') == "CN" else _DEFAULT_LOCALE
+        values['broker_profile'] = normalize_broker_profile(values.get('broker_profile'))
+        return values
 
     @property
     def strategy_path(self) -> str:
