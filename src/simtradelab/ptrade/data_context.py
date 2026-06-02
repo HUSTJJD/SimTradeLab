@@ -68,11 +68,11 @@ class DataContext:
         # 预解析 stock_metadata 日期列为 Timestamp（优化 get_Ashares 性能）
         if stock_metadata is not None and not stock_metadata.empty:
             if 'listed_date' in stock_metadata.columns:
-                self.listed_date_ts = pd.to_datetime(stock_metadata['listed_date'], format='mixed', errors='coerce')
+                self.listed_date_ts = pd.to_datetime(stock_metadata['listed_date'], errors='coerce')
             else:
                 self.listed_date_ts = None
             if 'de_listed_date' in stock_metadata.columns:
-                self.de_listed_date_ts = pd.to_datetime(stock_metadata['de_listed_date'], format='mixed', errors='coerce')
+                self.de_listed_date_ts = pd.to_datetime(stock_metadata['de_listed_date'], errors='coerce')
             else:
                 self.de_listed_date_ts = None
         else:
