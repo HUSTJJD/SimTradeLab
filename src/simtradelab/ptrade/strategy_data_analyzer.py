@@ -29,7 +29,8 @@ class DataDependencies(BaseModel):
 
     fundamental_tables: set[str] = Field(default_factory=set)
 
-    model_config = {"arbitrary_types_allowed": True}
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class StrategyDataAnalyzer(ast.NodeVisitor):

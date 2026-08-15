@@ -82,13 +82,15 @@ class DataContext:
 
     def _refresh_metadata_indices(self):
         # 预解析 stock_metadata 日期列为 Timestamp（优化 get_Ashares 性能）
+        # 注意：pandas 1.x 不支持 format='mixed'（那是 pandas 2.x 的推断选项），
+        # 误用会把日期全部解析成 NaT，导致 get_Ashares() 返回空列表。
         if self.stock_metadata is not None and not self.stock_metadata.empty:
             if 'listed_date' in self.stock_metadata.columns:
-                self.listed_date_ts = pd.to_datetime(self.stock_metadata['listed_date'], format='mixed', errors='coerce')
+                self.listed_date_ts = pd.to_datetime(self.stock_metadata['listed_date'], errors='coerce')
             else:
                 self.listed_date_ts = None
             if 'de_listed_date' in self.stock_metadata.columns:
-                self.de_listed_date_ts = pd.to_datetime(self.stock_metadata['de_listed_date'], format='mixed', errors='coerce')
+                self.de_listed_date_ts = pd.to_datetime(self.stock_metadata['de_listed_date'], errors='coerce')
             else:
                 self.de_listed_date_ts = None
         else:
