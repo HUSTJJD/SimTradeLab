@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import calendar
 import json
+from pathlib import Path
 import traceback
 import weakref
 from collections import OrderedDict
@@ -150,6 +151,54 @@ def _normalize_code(code: str) -> str:
         if code.endswith(ptrade_suffix):
             return code[: -len(ptrade_suffix)] + data_suffix
     return code
+
+
+_REPORT_MONTH = {3: "1", 6: "2", 9: "3", 12: "4"}
+
+
+def select_report_rows(stocks, data_dict, fields, query_ts, start_year, end_year, report_types):
+    """从已经加载的财务表里按年、按报告类型取多行。不访问网络。"""
+    if report_types is None:
+        types = None
+    elif isinstance(report_types, (list, tuple, set)):
+        types = {str(x) for x in report_types}
+    else:
+        types = {part.strip() for part in str(report_types).split(",") if part.strip()}
+    y0 = int(start_year) if start_year is not None else 1900
+    y1 = int(end_year) if end_year is not None else 2999
+    columns = list(dict.fromkeys(["publ_date", "end_date", *list(fields or [])]))
+    rows = []
+    query_ts = pd.Timestamp(query_ts)
+    for stock in stocks:
+        df = data_dict.get(stock) if data_dict is not None else None
+        if df is None or len(df) == 0:
+            continue
+        work = df
+        if "publ_date" in work.columns:
+            pub = pd.to_datetime(work["publ_date"], errors="coerce")
+            work = work.loc[pub.isna() | (pub <= query_ts)]
+        period_col = "end_date" if "end_date" in work.columns else ("date" if "date" in work.columns else None)
+        if period_col is None:
+            continue
+        periods = pd.to_datetime(work[period_col], errors="coerce")
+        mask = periods.dt.year.between(y0, y1)
+        if types:
+            mask = mask & periods.dt.month.map(_REPORT_MONTH).isin(types)
+        flag = mask.fillna(False).to_numpy()
+        picked = work.iloc[flag]
+        period_values = periods.to_numpy()[flag]
+        for idx in range(len(picked)):
+            src = picked.iloc[idx]
+            rec = {"secu_code": stock, "end_date": period_values[idx]}
+            for field in columns:
+                if field == "end_date":
+                    continue
+                rec[field] = src[field] if field in picked.columns else None
+            rows.append(rec)
+    out = pd.DataFrame(rows, columns=["secu_code", *columns])
+    if out.empty:
+        return out
+    return out.set_index("secu_code")
 
 
 def _to_ptrade_long_suffix(code: str) -> str:
@@ -500,6 +549,11 @@ class PtradeAPI:
         p.mkdir(parents=True, exist_ok=True)
         return str(p) + "/"
 
+    def create_dir(self, path: str) -> None:
+        """创建目录（如果不存在）"""
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+
     def get_Ashares(self, date: str | None = None) -> list[str]:
         """返回A股代码列表，支持历史查询"""
         if date is None:
@@ -514,7 +568,7 @@ class PtradeAPI:
         if self.data_context.listed_date_ts is not None:
             listed = self.data_context.listed_date_ts <= target_date
         else:
-            listed = pd.to_datetime(self.data_context.stock_metadata["listed_date"], format="mixed") <= target_date
+            listed = pd.to_datetime(self.data_context.stock_metadata["listed_date"], errors="coerce") <= target_date
 
         if self.data_context.de_listed_date_ts is not None:
             not_delisted = (self.data_context.stock_metadata["de_listed_date"] == "2900-01-01") | (
@@ -522,7 +576,7 @@ class PtradeAPI:
             )
         else:
             not_delisted = (self.data_context.stock_metadata["de_listed_date"] == "2900-01-01") | (
-                pd.to_datetime(self.data_context.stock_metadata["de_listed_date"], errors="coerce", format="mixed")
+                pd.to_datetime(self.data_context.stock_metadata["de_listed_date"], errors="coerce")
                 > target_date
             )
 
@@ -747,6 +801,8 @@ class PtradeAPI:
             "total_asset_grow_rate",
             "basic_eps_yoy",
             "np_parent_company_yoy",
+            "np_parent_company_cut_yoy",
+            "oper_cash_ps_grow_rate",
         ],
         "operating_ability": [
             "secu_code",
@@ -825,7 +881,7 @@ class PtradeAPI:
             date: 查询日期（默认为回测当前日期）
         """
         profile = self.broker_profile
-        _ = (report_types, merge_type)
+        _ = merge_type
         # 券商参数差异
         if profile == "guosheng":
             if is_dataframe is not None:
@@ -880,6 +936,13 @@ class PtradeAPI:
             query_ts = self.context.current_dt
         else:
             query_ts = pd.Timestamp(date)
+        if start_year is not None or end_year is not None:
+            if table == "valuation":
+                raise ValueError("valuation 只支持按日查询，不接受 start_year/end_year")
+            return select_report_rows(
+                stocks, data_dict, list(fields), query_ts,
+                start_year, end_year, report_types,
+            )
         cache_key = (table, query_ts)
 
         # 获取或创建日期索引缓存（LRUCache 自动淘汰）
@@ -1219,9 +1282,9 @@ class PtradeAPI:
         """按频率获取单只标的数据，统一处理别名、聚合和money字段兼容。"""
         if frequency in _MINUTE_FREQ_MINUTES:
             base = self.data_context.stock_data_dict_1m
-            if base is None or stock not in base:
+            df = self._frame_for_code(base, stock)
+            if df is None:
                 return None
-            df = base[stock]
             if frequency != "1m":
                 df = self._aggregate_intraday_kline(
                     df, _MINUTE_FREQ_MINUTES[frequency]
@@ -1229,12 +1292,10 @@ class PtradeAPI:
             return storage.ensure_alias_columns(df)
 
         if frequency in _PERIOD_FREQ_RULE:
-            base = self.data_context.stock_data_dict
-            if stock in base:
-                daily_df = base[stock]
-            elif stock in self.data_context.benchmark_data:
-                daily_df = self.data_context.benchmark_data[stock]
-            else:
+            daily_df = self._frame_for_code(self.data_context.stock_data_dict, stock)
+            if daily_df is None:
+                daily_df = self._frame_for_code(self.data_context.benchmark_data, stock)
+            if daily_df is None:
                 return None
             if fq in ("pre", "post"):
                 daily_df = self._apply_adj_factors(daily_df, stock, fq)
@@ -1243,14 +1304,30 @@ class PtradeAPI:
             df = self._aggregate_kline(daily_df, _PERIOD_FREQ_RULE[frequency])
             return storage.ensure_alias_columns(df)
 
-        base = self.data_context.stock_data_dict
-        if stock in base:
-            df = base[stock]
-        elif stock in self.data_context.benchmark_data:
-            df = self.data_context.benchmark_data[stock]
-        else:
+        df = self._frame_for_code(self.data_context.stock_data_dict, stock)
+        if df is None:
+            df = self._frame_for_code(self.data_context.benchmark_data, stock)
+        if df is None:
             return None
         return storage.ensure_alias_columns(df)
+
+    @staticmethod
+    def _frame_for_code(mapping, stock: str):
+        """行情字典用 .SS/.SZ。策略写 .XSHG/.XSHE 时改后缀再查一次。"""
+        if mapping is None:
+            return None
+        df = mapping.get(stock) if hasattr(mapping, "get") else None
+        if df is None and stock in mapping:
+            df = mapping[stock]
+        if df is None:
+            alt = _normalize_code(stock)
+            if alt != stock:
+                df = mapping.get(alt) if hasattr(mapping, "get") else None
+                if df is None and alt in mapping:
+                    df = mapping[alt]
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        return df
 
     @staticmethod
     def _fill_minute_gaps(df: pd.DataFrame, minutes: int, fill: str) -> pd.DataFrame:
@@ -2583,10 +2660,10 @@ class PtradeAPI:
             self.context.blotter.all_orders.append(order)
 
         if amount > 0:
-            self.log.info(t("api.order_buy", order_id=order_id, stock=security, amount=amount))
+            # self.log.info(t("api.order_buy", order_id=order_id, stock=security, amount=amount))
             success = self.order_processor.execute_buy(security, amount, price)
         else:
-            self.log.info(t("api.order_sell", order_id=order_id, stock=security, amount=abs(amount)))
+            # self.log.info(t("api.order_sell", order_id=order_id, stock=security, amount=abs(amount)))
             success = self.order_processor.execute_sell(security, abs(amount), price)
 
         if success:
