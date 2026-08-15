@@ -100,15 +100,172 @@ def _parquet_to_adj_cache(cache_path):
     combined = pd.read_parquet(cache_path)
     adj_factors_cache = {}
 
-    for symbol, group in combined.groupby('symbol'):
-        df = group.drop(columns=['symbol']).copy()
-        if 'date' in df.columns:
-            df.set_index('date', inplace=True)
-        elif 'index' in df.columns:
-            df.set_index('index', inplace=True)
-        adj_factors_cache[symbol] = df
+    # 一次性去掉 symbol 列并设置日期索引，再按 groupby 的位置分组切片，
+    # 避免逐组 drop(columns).copy() 的重复开销（结果逐值相同）。
+    date_col = 'date' if 'date' in combined.columns else (
+        'index' if 'index' in combined.columns else None
+    )
+    data = combined.drop(columns=['symbol'])
+    if date_col is not None:
+        data = data.set_index(date_col)
+    for symbol, positions in combined.groupby('symbol').indices.items():
+        adj_factors_cache[symbol] = data.iloc[positions]
 
     return adj_factors_cache
+
+
+class AdjFactorsDict(dict):
+    """复权因子惰性字典 —— 用 parquet filters 下推替代全量 read_parquet。
+
+    原实现每次 DataServer 初始化都把 pre/post 两张长表全量读入内存
+    （合计约 5073 万行 / 4.6 GB 常驻），而一次回测通常只访问几十只股票。
+    这里把 dict 的值换成「未加载」哨兵，按 symbol 惰性加载：
+
+    * ``bool`` / ``keys`` / ``in`` / ``[]`` / ``get`` 全部保持 dict 语义；
+    * ``ensure_loaded(keys)`` 用一次 ``filters=[('symbol','in', keys)]``
+      批量读入（row-group statistics 下推），避免逐只查询退化；
+    * 已验证 filters 切片与全量 ``groupby().indices`` 切片 ``assert_frame_equal``
+      （check_exact=True）逐值一致，DataFrame 的 index/dtype/列顺序不变。
+
+    ``candidate_keys`` 应当是 parquet symbol 集合的超集；对 parquet 中确实
+    不存在的 symbol 会标记为 _MISSING，``in`` 返回 False、``[]`` 抛 KeyError，
+    与全量加载得到的小 dict 行为一致。
+    """
+
+    _UNLOADED = object()
+    _MISSING = object()
+
+    def __init__(self, cache_path, candidate_keys):
+        super().__init__()
+        self._cache_path = cache_path
+        self._candidate = set(candidate_keys)
+        dict.update(self, dict.fromkeys(candidate_keys, self._UNLOADED))
+
+    def ensure_loaded(self, keys) -> None:
+        """一次性批量加载 keys 中尚未加载的 symbol。"""
+        missing = [
+            k for k in dict.fromkeys(keys)
+            if k in self._candidate and dict.__getitem__(self, k) is self._UNLOADED
+        ]
+        if not missing:
+            return
+
+        sub = pd.read_parquet(
+            self._cache_path, filters=[("symbol", "in", missing)]
+        )
+        found = set()
+        if not sub.empty:
+            date_col = "date" if "date" in sub.columns else (
+                "index" if "index" in sub.columns else None
+            )
+            data = sub.drop(columns=["symbol"])
+            if date_col is not None:
+                data = data.set_index(date_col)
+            for symbol, positions in sub.groupby("symbol").indices.items():
+                dict.__setitem__(self, symbol, data.iloc[positions])
+                found.add(symbol)
+        for k in missing:
+            if k not in found:
+                dict.__setitem__(self, k, self._MISSING)
+
+    def __contains__(self, key):
+        if key not in self._candidate:
+            return False
+        value = dict.__getitem__(self, key)
+        if value is self._UNLOADED:
+            self.ensure_loaded([key])
+            value = dict.__getitem__(self, key)
+        return value is not self._MISSING
+
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        if value is self._UNLOADED:
+            self.ensure_loaded([key])
+            value = dict.__getitem__(self, key)
+        if value is self._MISSING:
+            raise KeyError(key)
+        return value
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def _validate_adj_cache_file(cache_path) -> None:
+    """轻量元数据校验：保留原「缓存损坏立即重建」的时机，但不读全量数据。"""
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(cache_path)
+    names = set(pf.schema_arrow.names)
+    required = {"symbol", "adj_a", "adj_b"}
+    if not required.issubset(names):
+        raise ValueError(f"复权缓存缺少必要列: {required - names}")
+    if pf.metadata.num_rows <= 0:
+        raise ValueError("复权缓存为空")
+
+
+def _load_lazy_adj_cache(data_context, kind):
+    """返回按 symbol 惰性加载的复权因子字典。"""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    cache_path = _adj_cache_path(data_context.stock_data_dict.data_dir, kind)
+    create = create_adj_pre_cache if kind == "pre" else create_adj_post_cache
+
+    if not os.path.exists(cache_path):
+        create(data_context)
+
+    logger.info("正在校验%s复权因子缓存..." % ("前" if kind == "pre" else "后"))
+    try:
+        _validate_adj_cache_file(cache_path)
+    except Exception as e:
+        logger.error(f"缓存文件损坏或格式错误: {e}")
+        try:
+            os.remove(cache_path)
+            logger.info("已删除损坏的缓存文件，重新创建...")
+        except OSError as remove_error:
+            logger.error(f"删除损坏的缓存文件失败: {remove_error}")
+            raise
+        create(data_context)
+        _validate_adj_cache_file(cache_path)
+
+    candidate = list(data_context.stock_data_dict.keys())
+    cache = AdjFactorsDict(cache_path, candidate)
+    logger.info(
+        f"✓ {'前' if kind == 'pre' else '后'}复权因子缓存就绪 "
+        f"（{len(candidate)} 只股票按需加载）"
+    )
+    return cache
+
+
+def _load_exrights_for_adj(data_context, all_stocks, data_dir, num_workers, logger):
+    """加载全市场除权事件；同一 data_context 内 pre/post 缓存共用一次结果。
+
+    create_adj_pre_cache / create_adj_post_cache 原本各自全市场扫一遍
+    storage.load_exrights，这里按 (data_dir, all_stocks) 缓存到 data_context
+    实例上（同一 DataServer 初始化传入的是同一个 temp_context），避免重复
+    的多进程加载；跨 data_context 不共享，不会污染其他回测。
+    """
+    cache_key = (data_dir, tuple(all_stocks))
+    cached = getattr(data_context, '_adj_exrights_loaded', None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
+    from . import storage
+    exrights_results = Parallel(n_jobs=num_workers, backend="loky", verbose=0)(
+        delayed(storage.load_exrights)(data_dir, stock) for stock in all_stocks
+    )
+    exrights_cache = {}
+    for stock, exrights_full in zip(all_stocks, exrights_results):
+        if exrights_full and "exrights_events" in exrights_full:
+            ex_df = exrights_full["exrights_events"]
+            if not ex_df.empty:
+                exrights_cache[stock] = ex_df
+    logger.info(f"    已加载 {len(exrights_cache)} 只股票的除权数据")
+    data_context._adj_exrights_loaded = (cache_key, exrights_cache)
+    return exrights_cache
 
 
 @timer(threshold=0.1, name="perf.name.adj_pre_create")
@@ -125,23 +282,13 @@ def create_adj_pre_cache(data_context):
     stock_data_cache = {s: data_context.stock_data_dict.get(s) for s in all_stocks}
 
     logger.info("  加载除权事件数据...")
-    from . import storage
     data_dir = data_context.stock_data_dict.data_dir
     num_workers = int(os.getenv("PTRADE_NUM_WORKERS", "-1"))
 
     try:
-        exrights_results = Parallel(n_jobs=num_workers, backend="loky", verbose=0)(
-            delayed(storage.load_exrights)(data_dir, stock) for stock in all_stocks
+        exrights_cache = _load_exrights_for_adj(
+            data_context, all_stocks, data_dir, num_workers, logger
         )
-
-        exrights_cache = {}
-        for stock, exrights_full in zip(all_stocks, exrights_results):
-            if exrights_full and "exrights_events" in exrights_full:
-                ex_df = exrights_full["exrights_events"]
-                if not ex_df.empty:
-                    exrights_cache[stock] = ex_df
-
-        logger.info(f"    已加载 {len(exrights_cache)} 只股票的除权数据")
 
         logger.info(f"  并行计算前复权因子({num_workers if num_workers > 0 else 'auto'} 进程)...")
 
@@ -188,47 +335,11 @@ def create_adj_pre_cache(data_context):
 
 @timer(threshold=0.1, name="perf.name.adj_pre_load")
 def load_adj_pre_cache(data_context):
-    """加载前复权因子缓存
+    """加载前复权因子缓存（按 symbol 惰性加载）
 
     前复权价 = adj_a * 未复权价 + adj_b
     """
-    import logging
-    logger = logging.getLogger(__name__)
-
-    cache_path = _adj_cache_path(data_context.stock_data_dict.data_dir, "pre")
-
-    if not os.path.exists(cache_path):
-        try:
-            create_adj_pre_cache(data_context)
-        except Exception as e:
-            logger.error(f"创建前复权因子缓存失败: {e}")
-            raise
-
-    logger.info("正在加载前复权因子缓存...")
-
-    try:
-        adj_factors_cache = _parquet_to_adj_cache(cache_path)
-
-        if adj_factors_cache is None:
-            raise FileNotFoundError("缓存文件为空")
-
-        logger.info(f"✓ 前复权因子缓存加载完成！共 {len(adj_factors_cache)} 只股票")
-        return adj_factors_cache
-
-    except FileNotFoundError:
-        logger.error(f"缓存文件不存在: {cache_path}")
-        create_adj_pre_cache(data_context)
-        return load_adj_pre_cache(data_context)
-    except Exception as e:
-        logger.error(f"缓存文件损坏或格式错误: {e}")
-        try:
-            os.remove(cache_path)
-            logger.info("已删除损坏的缓存文件，重新创建...")
-            create_adj_pre_cache(data_context)
-            return load_adj_pre_cache(data_context)
-        except OSError as remove_error:
-            logger.error(f"删除损坏的缓存文件失败: {remove_error}")
-            raise
+    return _load_lazy_adj_cache(data_context, "pre")
 
 
 def _calculate_adj_post_factors_from_events(stock, stock_df, exrights_events):
@@ -261,9 +372,18 @@ def _calculate_adj_post_factors_from_events(stock, stock_df, exrights_events):
         backward_b = np.zeros(n_events + 1, dtype="float64")
 
         for i in range(n_events):
+            # 官方口径（PTrade/api_doc.txt get_stock_exrights 示例 / PTRADE_PARQUET_FORMAT.md）:
+            #   后复权价 = A * 原价 + B
+            #   A[i+1] = A[i] * m,  m = 1 + allotted_ps + rationed_ps
+            #   B[i+1] = B[i] + A[i] * (bonus_ps - rationed_ps * rationed_px)
+            # 官方示例 600570.SS: (1.0,0.430) -> (1.5,0.630) -> (2.1,0.630)
+            #                  -> (2.94,0.861)，可用于回归断言。
+            # 旧实现 `B[i]*m + bonus` 会把因子本身再乘一次 m，导致后复权价系统性偏高。
             m = 1.0 + allotted_ps[i] + rationed_ps[i]
             backward_a[i + 1] = backward_a[i] * m
-            backward_b[i + 1] = backward_b[i] * m + bonus_ps[i] - rationed_ps[i] * rationed_px[i]
+            backward_b[i + 1] = backward_b[i] + backward_a[i] * (
+                bonus_ps[i] - rationed_ps[i] * rationed_px[i]
+            )
 
         factor_idx = np.searchsorted(ex_dates_dt.values, stock_df.index.values, side="right")
 
@@ -292,23 +412,13 @@ def create_adj_post_cache(data_context):
     stock_data_cache = {s: data_context.stock_data_dict.get(s) for s in all_stocks}
 
     logger.info("  加载除权事件数据...")
-    from . import storage
     data_dir = data_context.stock_data_dict.data_dir
     num_workers = int(os.getenv("PTRADE_NUM_WORKERS", "-1"))
 
     try:
-        exrights_results = Parallel(n_jobs=num_workers, backend="loky", verbose=0)(
-            delayed(storage.load_exrights)(data_dir, stock) for stock in all_stocks
+        exrights_cache = _load_exrights_for_adj(
+            data_context, all_stocks, data_dir, num_workers, logger
         )
-
-        exrights_cache = {}
-        for stock, exrights_full in zip(all_stocks, exrights_results):
-            if exrights_full and "exrights_events" in exrights_full:
-                ex_df = exrights_full["exrights_events"]
-                if not ex_df.empty:
-                    exrights_cache[stock] = ex_df
-
-        logger.info(f"    已加载 {len(exrights_cache)} 只股票的除权数据")
 
         logger.info(f"  并行计算后复权因子({num_workers if num_workers > 0 else 'auto'} 进程)...")
 
@@ -355,47 +465,11 @@ def create_adj_post_cache(data_context):
 
 @timer(threshold=0.1, name="perf.name.adj_post_load")
 def load_adj_post_cache(data_context):
-    """加载后复权因子缓存
+    """加载后复权因子缓存（按 symbol 惰性加载）
 
     后复权价 = adj_a * 未复权价 + adj_b
     """
-    import logging
-    logger = logging.getLogger(__name__)
-
-    cache_path = _adj_cache_path(data_context.stock_data_dict.data_dir, "post")
-
-    if not os.path.exists(cache_path):
-        try:
-            create_adj_post_cache(data_context)
-        except Exception as e:
-            logger.error(f"创建后复权因子缓存失败: {e}")
-            raise
-
-    logger.info("正在加载后复权因子缓存...")
-
-    try:
-        adj_factors_cache = _parquet_to_adj_cache(cache_path)
-
-        if adj_factors_cache is None:
-            raise FileNotFoundError("缓存文件为空")
-
-        logger.info(f"✓ 后复权因子缓存加载完成！共 {len(adj_factors_cache)} 只股票")
-        return adj_factors_cache
-
-    except FileNotFoundError:
-        logger.error(f"缓存文件不存在: {cache_path}")
-        create_adj_post_cache(data_context)
-        return load_adj_post_cache(data_context)
-    except Exception as e:
-        logger.error(f"缓存文件损坏或格式错误: {e}")
-        try:
-            os.remove(cache_path)
-            logger.info("已删除损坏的缓存文件，重新创建...")
-            create_adj_post_cache(data_context)
-            return load_adj_post_cache(data_context)
-        except OSError as remove_error:
-            logger.error(f"删除损坏的缓存文件失败: {remove_error}")
-            raise
+    return _load_lazy_adj_cache(data_context, "post")
 
 
 def create_dividend_cache(data_context):

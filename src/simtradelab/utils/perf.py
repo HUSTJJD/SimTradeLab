@@ -77,22 +77,22 @@ def timer(threshold=0.1, name=None):
                     if class_name == 'PtradeAPI':
                         # 如果是批量操作，显示批次大小
                         from simtradelab.i18n import t as _t
-                        if len(args) > 1 and isinstance(args[1], (list, tuple)):
-                            print(_t("perf.batch_timing", name=func_name, count=len(args[1]), time="{:.2f}".format(elapsed)), flush=True)
-                        else:
-                            print(_t("perf.timing", name=func_name, time="{:.2f}".format(elapsed)), flush=True)
+                        # if len(args) > 1 and isinstance(args[1], (list, tuple)):
+                        #     print(_t("perf.batch_timing", name=func_name, count=len(args[1]), time="{:.2f}".format(elapsed)), flush=True)
+                        # else:
+                        #     print(_t("perf.timing", name=func_name, time="{:.2f}".format(elapsed)), flush=True)
                     elif class_name in ['BacktestRunner', 'StrategyExecutionEngine', 'ServerBacktestRunner']:
                         # 回测相关类显示耗时
                         from simtradelab.i18n import t
-                        print(t("perf.complete", name=func_name, time=format_elapsed_time(elapsed)), flush=True)
+                        # print(t("perf.complete", name=func_name, time=format_elapsed_time(elapsed)), flush=True)
                     else:
                         # 其他类默认格式
                         from simtradelab.i18n import t as _t
-                        print(_t("perf.timing", name=func_name, time="{:.2f}".format(elapsed)), flush=True)
+                        # print(_t("perf.timing", name=func_name, time="{:.2f}".format(elapsed)), flush=True)
                 else:
                     # 没有实例的情况（模块级函数）
                     from simtradelab.i18n import t as _t
-                    print(_t("perf.timing", name=func_name, time="{:.2f}".format(elapsed)), flush=True)
+                    # print(_t("perf.timing", name=func_name, time="{:.2f}".format(elapsed)), flush=True)
             return result
         return wrapper
     return decorator

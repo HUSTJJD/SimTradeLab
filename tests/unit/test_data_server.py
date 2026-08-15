@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 import pytest
 
@@ -24,6 +26,9 @@ def reset_data_server():
 
 def test_data_path_expands_user_home_before_resolving(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    if os.name == "nt":
+        # Windows 的 Path.expanduser 优先读 USERPROFILE，忽略 HOME。
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr(data_server_module, "_migrate_legacy_data", lambda path: None)
     monkeypatch.setattr(data_server_module.atexit, "register", lambda callback: None)
     monkeypatch.setattr(DataServer, "_load_data", lambda self, required_data, frequency: None)

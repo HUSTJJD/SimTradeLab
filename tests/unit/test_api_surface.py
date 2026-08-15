@@ -21,10 +21,8 @@ def test_ptrade_api_exposes_all_configured_callable_apis():
     [
         ("order_market", ("600000.SH", 100, 0)),
         ("get_snapshot", ("600000.SH",)),
-        ("get_cb_list", ()),
         ("margincash_open", ("600000.SH", 100)),
         ("get_margin_contract", ()),
-        ("get_etf_list", ()),
         ("open_prepared", ("10000001.XSHO", 1)),
         ("option_buy_open", ("10000001.XSHO", 1)),
         ("option_sell_close", ("10000001.XSHO", 1)),

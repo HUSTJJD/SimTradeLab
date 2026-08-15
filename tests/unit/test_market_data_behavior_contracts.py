@@ -45,7 +45,12 @@ def test_minute_query_does_not_fallback_to_future_close_bar(ptrade_api, api_name
             count=1,
         )
 
-    assert result.empty
+    # 文档「异常时返回 None」：get_history 无数据返回 None；
+    # get_price 在数据源存在但切片为空时仍返回空 DataFrame。
+    if api_name == "get_history":
+        assert result is None
+    else:
+        assert result.empty
 
 
 def test_get_history_sparse_minute_fill_returns_exact_requested_count(ptrade_api):
@@ -273,7 +278,7 @@ def test_sparse_aggregated_minutes_use_fixed_session_anchor_buckets(
             include=True,
             fill="nan",
         )
-        assert partial.empty
+        assert partial is None
 
 
 @pytest.mark.parametrize("first_fill", ["nan", "pre"])
@@ -397,8 +402,11 @@ def test_get_history_cache_preserves_requested_stock_order(ptrade_api):
     first = ptrade_api.get_history(2, field="close", security_list=first_order)
     second = ptrade_api.get_history(2, field="close", security_list=second_order)
 
-    assert list(first.columns) == first_order
-    assert list(second.columns) == second_order
+    # 3.11 多股票口径：列固定为 code + 字段，请求顺序体现在 code 列分组。
+    assert list(first.columns) == ["code", "close"]
+    assert list(second.columns) == ["code", "close"]
+    assert first["code"].drop_duplicates().tolist() == first_order
+    assert second["code"].drop_duplicates().tolist() == second_order
 
 
 def test_get_history_cache_separates_single_stock_and_list_return_shapes(ptrade_api):
@@ -409,7 +417,8 @@ def test_get_history_cache_separates_single_stock_and_list_return_shapes(ptrade_
     listed = ptrade_api.get_history(2, field="close", security_list=[stock])
 
     assert list(single.columns) == ["close"]
-    assert list(listed.columns) == [stock]
+    assert list(listed.columns) == ["code", "close"]
+    assert listed["code"].eq(stock).all()
 
 
 def test_get_history_cache_separates_frequency(ptrade_api):
@@ -478,6 +487,45 @@ def test_get_history_cache_separates_adjustment_mode(ptrade_api):
 
     assert raw["close"].tolist() == [10.0, 11.0, 12.0]
     assert adjusted["close"].tolist() == [6.0, 6.5, 7.0]
+
+
+def test_minute_fq_pre_applies_adjustment_factors(ptrade_api):
+    """api_doc.txt: fq 对 1m~120m 同样有效，分钟频不再静默忽略复权。"""
+    stock = "600000.SH"
+    idx = pd.to_datetime(["2024-01-02 09:31", "2024-01-02 09:32"])
+    ptrade_api.data_context.stock_data_dict_1m = {
+        stock: pd.DataFrame(
+            {
+                "open": [10.0, 11.0],
+                "high": [10.0, 11.0],
+                "low": [10.0, 11.0],
+                "close": [10.0, 11.0],
+                "volume": [100.0, 100.0],
+                "money": [1000.0, 1000.0],
+            },
+            index=idx,
+        )
+    }
+    ptrade_api.data_context.adj_pre_cache = {
+        stock: pd.DataFrame(
+            {"adj_a": [0.5], "adj_b": [1.0]},
+            index=pd.DatetimeIndex([pd.Timestamp("2024-01-02")]),
+        )
+    }
+    ptrade_api.context.frequency = "1m"
+    ptrade_api.context.current_dt = pd.Timestamp("2024-01-02 09:33")
+    ptrade_api.context.blotter.current_dt = ptrade_api.context.current_dt
+
+    raw = ptrade_api.get_history(
+        2, frequency="1m", field="close", security_list=stock, fq=None, include=True
+    )
+    adjusted = ptrade_api.get_history(
+        2, frequency="1m", field="close", security_list=stock, fq="pre", include=True
+    )
+
+    # 首根为真实行情 bar（末根为 include 的 NaN 填充）：0.5 * 11 + 1 = 6.5。
+    assert raw["close"].iloc[0] == 11.0
+    assert adjusted["close"].iloc[0] == 6.5
 
 
 def test_get_history_cache_isolated_by_data_context(ptrade_api, simple_log):
@@ -724,9 +772,14 @@ def test_get_history_cache_hits_same_day_and_clears_on_date_change(
 def test_get_history_cache_evicts_at_configured_capacity(
     ptrade_api, simple_log, monkeypatch
 ):
-    monkeypatch.setattr(
-        config, "cache", config.cache.model_copy(update={"history_cache_size": 2})
+    # pydantic v2 提供 model_copy，v1 使用 copy(update=...)。
+    model_copy = getattr(config.cache, "model_copy", None)
+    patched_cache = (
+        model_copy(update={"history_cache_size": 2})
+        if model_copy is not None
+        else config.cache.copy(update={"history_cache_size": 2})
     )
+    monkeypatch.setattr(config, "cache", patched_cache)
     api = PtradeAPI(ptrade_api.data_context, ptrade_api.context, simple_log)
     api.context.current_dt = pd.Timestamp("2024-01-03")
 

@@ -146,6 +146,18 @@ class TestSetAPI:
         assert len(ptrade_api.active_universe) == 3
         assert '600000.SH' in ptrade_api.active_universe
 
+    def test_set_universe_preserves_request_order(self, ptrade_api):
+        """文档口径：universe 用保序 list 存储，返回顺序与传入一致（不再是 set）。"""
+        ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)
+
+        stocks = ['600519.SH', '600000.SH', '000001.SZ']
+        ptrade_api.set_universe(stocks)
+        assert list(ptrade_api.active_universe) == stocks
+
+        # 重复设置同样保序，且不会与上一次结果串味
+        ptrade_api.set_universe(['000001.SZ', '600519.SH'])
+        assert list(ptrade_api.active_universe) == ['000001.SZ', '600519.SH']
+
     def test_set_benchmark(self, ptrade_api):
         """测试set_benchmark只能在initialize调用"""
         # 在initialize阶段可以调用

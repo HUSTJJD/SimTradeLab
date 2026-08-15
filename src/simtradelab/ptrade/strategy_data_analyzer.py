@@ -29,7 +29,8 @@ class DataDependencies(BaseModel):
 
     fundamental_tables: set[str] = Field(default_factory=set)
 
-    model_config = {"arbitrary_types_allowed": True}
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class StrategyDataAnalyzer(ast.NodeVisitor):
@@ -63,6 +64,9 @@ class StrategyDataAnalyzer(ast.NodeVisitor):
                             break
                 if table_arg is not None and isinstance(table_arg, ast.Constant) and isinstance(table_arg.value, str):
                     self.fundamental_tables.add(table_arg.value)
+                else:
+                    # 表名是变量时静态分析看不到，估值和财务都要加载。
+                    self.fundamental_tables.add("valuation")
 
         self.generic_visit(node)
 

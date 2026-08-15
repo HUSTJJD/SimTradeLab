@@ -24,7 +24,9 @@ class _NullLog:
 
 def test_minute_context_uses_minute_stock_data():
     runner = BacktestRunner()
-    daily_data = object()
+    # runner 初始化会预建日期索引，日线数据需支持 keys()；
+    # 用空字典作日线哨兵，分钟数据仍用独立对象保持身份断言。
+    daily_data = {}
     minute_data = object()
     runner.stock_data_dict = daily_data
     runner.stock_data_dict_1m = minute_data

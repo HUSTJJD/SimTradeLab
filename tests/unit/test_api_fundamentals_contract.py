@@ -120,3 +120,25 @@ def test_get_fundamentals_rejects_unknown_table(ptrade_api):
 
     with pytest.raises(ValueError):
         ptrade_api.get_fundamentals("600000.SH", "not_a_table", fields="roe", date="2024-05-01")
+
+
+def test_get_fundamentals_without_date_uses_previous_trade_day(ptrade_api, data_context):
+    """api_doc.txt: 不传 date 时取回测日期的上一交易日，而非当天（避免未来函数）。"""
+    _activate(ptrade_api, "2024-01-05")
+    data_context.trade_days = pd.DatetimeIndex(pd.date_range("2024-01-01", periods=10))
+    data_context.fundamentals_dict["600000.SH"] = pd.DataFrame(
+        {
+            "publ_date": [pd.Timestamp("2024-01-04"), pd.Timestamp("2024-01-05")],
+            "end_date": [pd.Timestamp("2023-12-31"), pd.Timestamp("2024-03-31")],
+            "roe": [0.11, 0.22],
+            "secu_abbr": ["浦发银行", "浦发银行"],
+        }
+    )
+
+    result = ptrade_api.get_fundamentals(
+        "600000.SH", "profit_ability", fields=["roe", "end_date"]
+    )
+
+    # 查询日回退到 2024-01-04，公告日为 01-05 的那行不得进入结果。
+    assert result.loc["600000.SH", "roe"] == 0.11
+    assert result.loc["600000.SH", "end_date"] == pd.Timestamp("2023-12-31")

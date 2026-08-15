@@ -77,7 +77,8 @@ class TestAPIAdvancedFormats:
         ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.HANDLE_DATA)
         ptrade_api.context.current_dt = pd.Timestamp("2024-01-05")
 
-        # is_dict=True应返回字典格式 {stock: {field: array}}
+        # is_dict=True 返回 OrderedDict[str, numpy structured array]：
+        # 首列 datetime(int64, YYYYMMDDHHMM)，其后是请求的行情字段。
         result = ptrade_api.get_history(
             count=3,
             field=["close", "volume"],
@@ -85,18 +86,18 @@ class TestAPIAdvancedFormats:
             is_dict=True,
         )
 
-        # 验证返回字典格式
         assert isinstance(result, dict)
-        if result:  # 如果有数据
-            for stock in result:
-                assert isinstance(result[stock], dict)
-                for field in result[stock]:
-                    assert isinstance(
-                        result[stock][field], (np.ndarray, pd.Series, list)
-                    )
+        assert result
+        for stock, arr in result.items():
+            assert isinstance(arr, np.ndarray)
+            assert arr.dtype.names is not None
+            assert arr.dtype.names[0] == "datetime"
+            assert arr["datetime"].dtype == np.dtype("int64")
+            assert set(arr.dtype.names[1:]) == {"close", "volume"}
+            assert len(arr) == 3
 
     def test_get_history_single_stock_not_in_result(self, ptrade_api):
-        """测试get_history单股票不在结果中返回空DataFrame"""
+        """测试get_history查询不存在的股票时按文档返回None"""
         ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)
         ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.HANDLE_DATA)
         ptrade_api.context.current_dt = pd.Timestamp("2024-01-05")
@@ -106,9 +107,8 @@ class TestAPIAdvancedFormats:
             count=3, field="close", security_list="INVALID.XX"
         )
 
-        # 应返回空DataFrame
-        assert isinstance(result, pd.DataFrame)
-        assert result.empty
+        # api_doc.txt：「正常返回dict类型数据，异常时返回None(NoneType)」
+        assert result is None
 
     def test_get_history_single_stock_single_field(self, ptrade_api):
         """测试get_history单股票单字段返回DataFrame"""
@@ -166,7 +166,7 @@ class TestAPIAdvancedFormats:
                 assert isinstance(result.empty, bool)
 
     def test_get_history_empty_result_with_is_dict(self, ptrade_api):
-        """测试get_history空结果时is_dict=True返回空字典"""
+        """测试get_history空结果时is_dict=True按文档返回None"""
         ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)
         ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.HANDLE_DATA)
         ptrade_api.context.current_dt = pd.Timestamp("2024-01-05")
@@ -176,12 +176,11 @@ class TestAPIAdvancedFormats:
             count=3, field="close", security_list="INVALID.XX", is_dict=True
         )
 
-        # 应返回空字典
-        assert isinstance(result, dict)
-        assert len(result) == 0
+        # 文档「异常时返回 None」+ changelog 05.013：空结果不再返回空 OrderedDict。
+        assert result is None
 
     def test_get_history_empty_result_without_is_dict(self, ptrade_api):
-        """测试get_history空结果时is_dict=False返回空DataFrame"""
+        """测试get_history空结果时is_dict=False同样返回None"""
         ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)
         ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.HANDLE_DATA)
         ptrade_api.context.current_dt = pd.Timestamp("2024-01-05")
@@ -194,12 +193,34 @@ class TestAPIAdvancedFormats:
             is_dict=False,
         )
 
-        # 应返回空DataFrame或dict（取决于实现）
-        if isinstance(result, pd.DataFrame):
-            assert result.empty
-        elif isinstance(result, dict):
-            assert len(result) == 0
-        # 如果返回None也是合理的（表示无数据）
+        # 文档「异常时返回None」：is_dict=False 空结果同样返回 None。
+        assert result is None
+
+    def test_get_price_default_fields_returns_documented_twelve_columns(self, ptrade_api, data_context):
+        """api_doc.txt: fields=None 默认返回 12 列；ensure_alias_columns 补 is_open/unlimited。"""
+        ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)
+        ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.HANDLE_DATA)
+        ptrade_api.context.current_dt = pd.Timestamp("2024-01-05")
+
+        stock_df = data_context.stock_data_dict["600000.SH"].copy()
+        stock_df["preclose"] = stock_df["close"] - 0.1
+        stock_df["high_limit"] = stock_df["close"] + 1.0
+        stock_df["low_limit"] = stock_df["close"] - 1.0
+        data_context.stock_data_dict["600000.SH"] = stock_df
+
+        result = ptrade_api.get_price(
+            "600000.SH", start_date="2024-01-02", end_date="2024-01-04"
+        )
+
+        assert list(result.columns) == [
+            "open", "high", "low", "close", "volume", "money", "price",
+            "is_open", "preclose", "high_limit", "low_limit", "unlimited",
+        ]
+        # money/price 别名取自 amount/close；is_open = volume>0；unlimited 恒 0。
+        np.testing.assert_allclose(result["money"], stock_df.loc[result.index, "amount"])
+        np.testing.assert_allclose(result["price"], stock_df.loc[result.index, "close"])
+        assert result["is_open"].tolist() == [1, 1, 1]
+        assert result["unlimited"].tolist() == [0, 0, 0]
 
 
 class TestAPIComplexBranches:

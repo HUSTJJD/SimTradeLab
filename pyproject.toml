@@ -54,6 +54,21 @@ Homepage = "https://github.com/kay-ou/SimTradeLab"
 Repository = "https://github.com/kay-ou/SimTradeLab"
 Documentation = "https://github.com/kay-ou/SimTradeLab/tree/main/docs"
 
+[tool.poetry.dependencies]
+python = "^3.9"
+pandas = ">=1.5.0"
+# pyarrow 26 起运行时强制 numpy>=2，而它的元数据不再声明 numpy 依赖，
+# pip 会解析出与 numpy<2 冲突的组合并在 import 时炸掉全部 parquet 读取
+pyarrow = ">=10.0.0,<26"
+numpy = ">=1.20.0,<2.0"
+cachetools = "^5.0.0"
+joblib = "^1.0.0"
+matplotlib = "^3.5.0"
+tqdm = "^4.0.0"
+pydantic = ">=1.10.0,<3.0.0"
+ta-lib = {version = "*", optional = true}
+optuna = {version = "^3.0.0", optional = true}
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0,<9.0.0",

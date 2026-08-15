@@ -26,10 +26,12 @@ class TestBrokerProfileCompat:
             security_list=["600000.SH"],
             fq="pre",
         )
+        # Python 3.11 口径：列表入参即多股票，返回 DataFrame，列为 code + 行情字段。
         assert isinstance(result, pd.DataFrame)
-        assert "600000.SH" in result.columns
+        assert list(result.columns) == ["code", "close"]
+        assert set(result["code"]) == {"600000.SH"}
         assert len(result) > 0
-        assert not result["600000.SH"].isna().all()
+        assert not result["close"].isna().all()
 
     def test_get_price_1m_context_with_1d_frequency_aligns_trade_day(self, ptrade_api):
         _set_broker_profile(ptrade_api, "auto")
@@ -166,8 +168,9 @@ class TestBrokerProfileCompat:
             security_list=None,
         )
         assert isinstance(result, pd.DataFrame)
-        assert "600000.SH" in result.columns
-        assert "000001.SZ" not in result.columns
+        assert list(result.columns) == ["code", "close"]
+        assert set(result["code"]) == {"600000.SH"}
+        assert "000001.SZ" not in set(result["code"])
 
     def test_get_history_fill_pre_fills_minute_gap(self, ptrade_api):
         _set_broker_profile(ptrade_api, "auto")
@@ -197,7 +200,8 @@ class TestBrokerProfileCompat:
         )
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 3
-        assert float(result["600000.SH"].iloc[1]) == float(result["600000.SH"].iloc[0])
+        assert set(result["code"]) == {"600000.SH"}
+        assert float(result["close"].iloc[1]) == float(result["close"].iloc[0])
 
     def test_get_history_invalid_fill_raises(self, ptrade_api, test_dates):
         _set_broker_profile(ptrade_api, "auto")
@@ -349,8 +353,8 @@ class TestBrokerProfileCompat:
         result = ptrade_api.get_history(
             count=1, frequency="1m", field="close", security_list=["000001.SZ"]
         )
-        assert isinstance(result, pd.DataFrame)
-        assert result.empty
+        # 文档「异常时返回 None」：回退后无数据同样返回 None，不再是空 DataFrame。
+        assert result is None
 
     def test_get_history_unlimited_dtype_shanxi(self, ptrade_api, test_dates):
         _set_broker_profile(ptrade_api, "shanxi")
@@ -383,7 +387,11 @@ class TestBrokerProfileCompat:
         assert isinstance(result, dict)
         assert "600000.SH" in result
         arr = result["600000.SH"]
-        assert arr.dtype.names == ("close", "volume")
+        assert isinstance(arr, np.ndarray)
+        # 首列为 datetime(int64, YYYYMMDDHHMM)，其后是请求的行情字段。
+        assert arr.dtype.names == ("datetime", "close", "volume")
+        assert arr["datetime"].dtype == np.dtype("int64")
+        assert (arr["datetime"] >= 202401010000).all()
 
     def test_documented_kwargs_for_futures_apis(self, ptrade_api):
         _set_broker_profile(ptrade_api, "auto")
