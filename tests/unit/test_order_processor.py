@@ -136,6 +136,21 @@ class TestOrderProcessor:
         # 应该返回None
         assert price is None
 
+    def test_get_execution_price_delisted_sell_falls_back_to_last_close(
+        self, order_processor, context, data_context
+    ):
+        """测试退市股卖出时回退到最后收盘价（持仓退市后调仓平仓）"""
+        context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)
+        context._lifecycle_controller.set_phase(LifecyclePhase.HANDLE_DATA)
+        stock_df = data_context.stock_data_dict['600000.SH']
+        last_close = float(stock_df['close'].iloc[-1])
+        # 退市后：current_dt 超出数据最后交易日
+        context.current_dt = stock_df.index[-1] + pd.Timedelta(days=30)
+
+        price = order_processor.get_execution_price('600000.SH', is_buy=False)
+        # 卖出价 = 退市前最后收盘价（含默认 0.1% 比例滑点，略低于收盘价）
+        assert price == pytest.approx(last_close, rel=1e-3)
+
     def test_get_execution_price_nan_price(self, order_processor, context, data_context):
         """测试价格为NaN的情况"""
         context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)

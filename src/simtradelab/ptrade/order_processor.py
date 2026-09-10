@@ -92,7 +92,15 @@ class OrderProcessor:
                     normalized_dt = pd.Timestamp(current_dt).normalize()
                     idx = date_dict.get(normalized_dt.value)
                     if idx is None:
-                        idx = stock_df.index.get_loc(normalized_dt)
+                        try:
+                            idx = stock_df.index.get_loc(normalized_dt)
+                        except KeyError:
+                            # 卖出退市持仓：current_dt 已超出该股数据最后交易日，回退最后收盘价平仓；
+                            # 买入（含未知日期）保持原语义返回 None。
+                            if not is_buy and normalized_dt > stock_df.index[-1]:
+                                idx = len(stock_df) - 1
+                            else:
+                                raise
 
                 # 成交量检查：volume=0 表示停牌，Ptrade会拒绝订单
                 volume = stock_df['volume'].values[idx]
