@@ -133,13 +133,8 @@ class OrderProcessor:
             # 无滑点
             slippage_amount = 0
 
-        # 最终成交价格 = 委托价格 ± 滑点金额
-        if is_buy:
-            # 买入向上滑点
-            final_price = base_price + slippage_amount
-        else:
-            # 卖出向下滑点
-            final_price = base_price - slippage_amount
+        # 最终成交价格 = 委托价格 ± 滑点金额（买入向上、卖出向下）
+        final_price = base_price + slippage_amount if is_buy else base_price - slippage_amount
 
         return final_price
 
