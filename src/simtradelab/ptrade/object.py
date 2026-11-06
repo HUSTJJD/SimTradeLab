@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from ..utils.performance_config import get_performance_config
 from .cache_manager import cache_manager
+from .code_compat import DualKeyDict, code_candidates
 from .lifecycle_controller import LifecyclePhase
 
 
@@ -226,8 +227,13 @@ class StockData:
         self._cached_phase = None  # 缓存的phase,用于判断是否需要重新加载
         self._cached_idx = None  # 缓存的idx,用于判断是否需要重新加载
 
-        if bt_ctx and bt_ctx.stock_data_dict and stock in bt_ctx.stock_data_dict:
-            self._stock_df = bt_ctx.stock_data_dict[stock]
+        if bt_ctx and bt_ctx.stock_data_dict:
+            # 策略可写 XSHG/XSHE 等官方全称尾缀，行情字典内部只用 .SS/.SZ
+            for candidate in code_candidates(stock):
+                if candidate in bt_ctx.stock_data_dict:
+                    self.stock = candidate
+                    self._stock_df = bt_ctx.stock_data_dict[candidate]
+                    break
 
     def _ensure_data_loaded(self):
         """确保数据已加载（延迟加载）"""
@@ -412,7 +418,8 @@ class Data(dict):
                 self._access_order.move_to_end(stock)  # O(1)操作
             return super().__getitem__(stock)
 
-        # 创建StockData对象并缓存
+        # 创建StockData对象并缓存。缓存键保留策略原写法；StockData 内部会自动
+        # 解析到行情字典里真实存在的 .SS/.SZ 键（见 StockData.__init__）。
         stock_data = StockData(stock, self.current_date, self._bt_ctx)
         super().__setitem__(stock, stock_data)
         self._access_order[stock] = None
@@ -493,7 +500,8 @@ class Portfolio:
     def __init__(self, initial_capital=100000.0, bt_ctx=None, context_obj=None):
         self._cash = initial_capital
         self.starting_cash = initial_capital
-        self.positions = {}
+        # 官方 api_doc L3084：四位尾缀或两位尾缀代码皆可作为键取到持仓值
+        self.positions = DualKeyDict()
         self.positions_value = 0.0
         self._bt_ctx = bt_ctx
         self._context = context_obj
@@ -504,7 +512,7 @@ class Portfolio:
         self._close_price_cache = {}
         self._close_price_cache_date = None
         # 持股批次追踪（用于分红税FIFO计算）
-        self._position_lots = {}
+        self._position_lots = DualKeyDict()
 
     def _invalidate_cache(self):
         """清空 portfolio_value 缓存（持仓变化时调用）

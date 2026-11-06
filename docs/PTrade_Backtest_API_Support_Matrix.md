@@ -14,8 +14,8 @@
 | 分类 | 数量 |
 | --- | ---: |
 | `full` | 26 |
-| `partial` | 26 |
-| `pending` | 2 |
+| `partial` | 27 |
+| `pending` | 1 |
 | `unsupported` | 10 |
 | 特殊项 `log` | 1 |
 | 合计 | 65 |
@@ -37,7 +37,7 @@
 | 类别 | API |
 | --- | --- |
 | 设置与调度 | `set_benchmark`、`set_commission` |
-| 行情与证券数据 | `get_price`、`get_market_detail`、`get_stock_info`、`get_stock_name`、`get_stock_status`、`get_stock_blocks`、`get_index_stocks`、`get_industry_stocks`、`get_Ashares` |
+| 行情与证券数据 | `get_price`、`get_market_detail`、`get_stock_info`、`get_stock_name`、`get_stock_status`、`get_stock_blocks`、`get_index_stocks`、`get_industry_stocks`、`get_Ashares`、`get_reits_list` |
 | 状态与上下文 | `get_all_trades_days`、`filter_stock_by_status`、`get_current_kline_count`、`get_frequency`、`get_business_type`、`is_trade` |
 | 交易与订单 | `cancel_order`、`get_open_orders` |
 | 文件与账户 | `get_user_name`、`get_research_path`、`get_trades_file` |
@@ -51,7 +51,6 @@
 
 ## Pending：兼容性待验证
 
-- `get_reits_list`：需要可验证的券商/PTrade 数据基线。
 - `get_trend_data`：券商可用性和集中竞价数据语义需要真实平台基线。
 
 ## Unsupported：明确不支持

@@ -162,7 +162,7 @@ PTRADE_API_CONTRACTS = {
         "tests/unit/test_api_fundamentals_contract.py::test_get_fundamentals_filters_by_publish_date_not_report_period",
     ),
     "get_Ashares": _contract("security_query", "partial"),
-    "get_reits_list": _contract("security_query", "pending"),
+    "get_reits_list": _contract("security_query", "partial"),
     "get_trend_data": _contract("market_data", "pending"),
     # Trading-calendar and context helpers
     "get_trading_day": _contract(

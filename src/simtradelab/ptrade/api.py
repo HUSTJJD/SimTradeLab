@@ -37,6 +37,11 @@ from simtradelab.utils.perf import timer
 from ..utils.paths import get_strategies_path
 from . import storage
 from .cache_manager import cache_manager
+from .code_compat import (
+    canonical_code,
+    code_candidates,
+    install_code_compat,
+)
 from .broker_profile import (
     is_api_supported_for_broker,
     needs_broker_support_guard,
@@ -47,12 +52,10 @@ from .lifecycle_config import _ALL_PHASES_FROZENSET, API_ALLOWED_PHASES_LOOKUP
 from .lifecycle_controller import PTradeLifecycleError
 from .order_processor import OrderProcessor
 
-# PTrade suffix -> SimTradeData suffix mapping
-_PTRADE_SUFFIX_MAP = {
-    ".XSHG": ".SS",
-    ".XSHE": ".SZ",
-    ".XBHS": ".SZ",
-}
+# PTrade 官方尾缀规则集中在 code_compat 模块（见该模块顶部官方文档依据）。
+# 旧实现把 .XBHS 一律映射成 .SZ 是错的：指数/板块尾缀不是交易所尾缀，
+# 且本地 000300.SS / 000905.SZ / 399370.SZ 并存，静态映射必然猜错。
+# 现在统一改为「按候选解析到数据里真实存在的键」。
 
 # 兼容各券商文档中的参数名差异（alias -> canonical）
 _API_KWARG_ALIASES = {
@@ -146,11 +149,8 @@ class _PTradeDataFrame(pd.DataFrame):
 
 
 def _normalize_code(code: str) -> str:
-    """Convert PTrade-style code (e.g. 000300.XSHG) to data format (000300.SS)."""
-    for ptrade_suffix, data_suffix in _PTRADE_SUFFIX_MAP.items():
-        if code.endswith(ptrade_suffix):
-            return code[: -len(ptrade_suffix)] + data_suffix
-    return code
+    """把官方全称尾缀规范化为引擎内部简称尾缀（见 code_compat 的官方依据）。"""
+    return canonical_code(code)
 
 
 _REPORT_MONTH = {3: "1", 6: "2", 9: "3", 12: "4"}
@@ -565,38 +565,68 @@ class PtradeAPI:
             return list(self.data_context.stock_data_dict.keys())
 
         # 使用预解析的 Timestamp 列（避免每次调用都解析日期字符串）
-        if self.data_context.listed_date_ts is not None:
+        frame = self.data_context.stock_metadata
+        if "security_type" in frame.columns:
+            kind = frame["security_type"].fillna("stock").astype(str)
+            frame = frame[kind.isin(["", "stock", "nan"])]
+        if frame is self.data_context.stock_metadata and self.data_context.listed_date_ts is not None:
             listed = self.data_context.listed_date_ts <= target_date
         else:
-            listed = pd.to_datetime(self.data_context.stock_metadata["listed_date"], errors="coerce") <= target_date
-
-        if self.data_context.de_listed_date_ts is not None:
-            not_delisted = (self.data_context.stock_metadata["de_listed_date"] == "2900-01-01") | (
+            listed = pd.to_datetime(frame["listed_date"], errors="coerce") <= target_date
+        if frame is self.data_context.stock_metadata and self.data_context.de_listed_date_ts is not None:
+            not_delisted = (frame["de_listed_date"] == "2900-01-01") | (
                 self.data_context.de_listed_date_ts > target_date
             )
         else:
-            not_delisted = (self.data_context.stock_metadata["de_listed_date"] == "2900-01-01") | (
-                pd.to_datetime(self.data_context.stock_metadata["de_listed_date"], errors="coerce")
-                > target_date
+            not_delisted = (frame["de_listed_date"] == "2900-01-01") | (
+                pd.to_datetime(frame["de_listed_date"], errors="coerce") > target_date
             )
+        return frame[listed & not_delisted].index.tolist()
 
-        return self.data_context.stock_metadata[listed & not_delisted].index.tolist()
+    def _instrument_frame(self) -> pd.DataFrame | None:
+        frame = getattr(self.data_context, "stock_metadata", None)
+        if frame is None or frame.empty:
+            return None
+        return frame
+
+    def _active_symbols(self, mask: pd.Series, date: str | None) -> list[str]:
+        """按上市日、退市日筛出仍在市的代码。"""
+        frame = self._instrument_frame()
+        if frame is None:
+            return []
+        target = self.context.current_dt if date is None else pd.Timestamp(date)
+        chosen = frame.loc[mask.reindex(frame.index, fill_value=False)]
+        if chosen.empty:
+            return []
+        if "listed_date" in chosen.columns:
+            listed = pd.to_datetime(chosen["listed_date"], errors="coerce") <= target
+        else:
+            listed = pd.Series(True, index=chosen.index)
+        if "de_listed_date" in chosen.columns:
+            alive = (chosen["de_listed_date"].astype(str) == "2900-01-01") | (
+                pd.to_datetime(chosen["de_listed_date"], errors="coerce") > target
+            )
+        else:
+            alive = pd.Series(True, index=chosen.index)
+        return sorted(chosen.index[listed.fillna(False) & alive.fillna(False)].astype(str).tolist())
+
+    def _names_and_codes(self, frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        if "stock_name" in frame.columns:
+            names = frame["stock_name"].fillna("").astype(str)
+        else:
+            names = pd.Series("", index=frame.index)
+        codes = frame.index.to_series().astype(str).str.split(".").str[0]
+        return names, codes
 
     @validate_lifecycle
     def get_reits_list(self, date: str | None = None) -> list[str]:
-        """获取基础设施公募REITs基金代码列表（回测简化版）"""
-        universe = set(self.get_Ashares(date))
-        if self.data_context.stock_metadata.empty:
-            return sorted([s for s in universe if s.startswith(("180", "508"))])
-
-        candidates = []
-        for code, row in self.data_context.stock_metadata.iterrows():
-            if code not in universe:
-                continue
-            name = str(row.get("stock_name", "")).upper()
-            if code.startswith(("180", "508")) or "REIT" in name:
-                candidates.append(code)
-        return sorted(candidates)
+        """获取基础设施公募REITs基金代码列表。"""
+        frame = self._instrument_frame()
+        if frame is None:
+            return []
+        names, codes = self._names_and_codes(frame)
+        mask = names.str.upper().str.contains("REIT") | codes.str.startswith(("180", "508"))
+        return self._active_symbols(mask, date)
 
     def get_trade_days(
         self, start_date: str | None = None, end_date: str | None = None, count: int | None = None
@@ -1313,21 +1343,20 @@ class PtradeAPI:
 
     @staticmethod
     def _frame_for_code(mapping, stock: str):
-        """行情字典用 .SS/.SZ。策略写 .XSHG/.XSHE 时改后缀再查一次。"""
+        """行情字典内部用 .SS/.SZ；策略可写任意官方尾缀，按等价候选逐个查。"""
         if mapping is None:
             return None
-        df = mapping.get(stock) if hasattr(mapping, "get") else None
-        if df is None and stock in mapping:
-            df = mapping[stock]
-        if df is None:
-            alt = _normalize_code(stock)
-            if alt != stock:
-                df = mapping.get(alt) if hasattr(mapping, "get") else None
-                if df is None and alt in mapping:
-                    df = mapping[alt]
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            return None
-        return df
+        for candidate in code_candidates(stock):
+            df = mapping.get(candidate) if hasattr(mapping, "get") else None
+            if df is None:
+                try:
+                    if candidate in mapping:
+                        df = mapping[candidate]
+                except (KeyError, TypeError):
+                    df = None
+            if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
 
     @staticmethod
     def _fill_minute_gaps(df: pd.DataFrame, minutes: int, fill: str) -> pd.DataFrame:
@@ -1727,9 +1756,50 @@ class PtradeAPI:
         self._unsupported_api("get_snapshot", "实时行情接口")
 
     @validate_lifecycle
-    def get_cb_info(self) -> None:
-        """获取可转债基础信息（当前本地回测不支持可转债交易接口）"""
-        self._unsupported_api("get_cb_info", "可转债交易接口")
+    def get_cb_info(self) -> pd.DataFrame:
+        """可转债代码和名称。转股价、溢价率没有本地来源，这些列留空。"""
+        columns = [
+            "bond_code",
+            "bond_name",
+            "stock_code",
+            "stock_name",
+            "list_date",
+            "premium_rate",
+            "convert_date",
+            "maturity_date",
+            "convert_rate",
+            "convert_price",
+            "convert_value",
+        ]
+        codes = self.get_cb_list()
+        if not codes:
+            return pd.DataFrame(columns=columns)
+        frame = self._instrument_frame()
+        rows = []
+        for code in codes:
+            name = ""
+            listed = None
+            if frame is not None and code in frame.index:
+                if "stock_name" in frame.columns and pd.notna(frame.at[code, "stock_name"]):
+                    name = str(frame.at[code, "stock_name"])
+                if "listed_date" in frame.columns and pd.notna(frame.at[code, "listed_date"]):
+                    listed = str(frame.at[code, "listed_date"])[:10]
+            rows.append(
+                {
+                    "bond_code": code,
+                    "bond_name": name,
+                    "stock_code": None,
+                    "stock_name": None,
+                    "list_date": listed,
+                    "premium_rate": np.nan,
+                    "convert_date": None,
+                    "maturity_date": None,
+                    "convert_rate": np.nan,
+                    "convert_price": np.nan,
+                    "convert_value": np.nan,
+                }
+            )
+        return pd.DataFrame(rows, columns=columns)
 
     @timer()
     def get_history(
@@ -2352,7 +2422,6 @@ class PtradeAPI:
     def get_index_stocks(self, index_code: str, date: str | None = None) -> list[str]:
         """获取指数成份股（支持向前回溯查找）"""
         original_code = index_code
-        index_code_norm = _normalize_code(index_code)
         if not self.data_context.index_constituents:
             return []
 
@@ -2380,10 +2449,9 @@ class PtradeAPI:
         # 使用 bisect 找到小于等于 date 的最近日期
         idx = bisect.bisect_right(available_dates, query_date)
 
-        # 兼容多种后缀写法：优先原始，再试归一化（如 XSHG->SS）
-        index_candidates = [original_code]
-        if index_code_norm != original_code:
-            index_candidates.append(index_code_norm)
+        # 官方 index_code 可为 000300.SS / 000300.XSHG / 000300.XBHS（api_doc L2516）。
+        # 本地成份股数据只用 .SS/.SZ，故按全部等价写法依次尝试。
+        index_candidates = code_candidates(original_code)
 
         if idx > 0:
             # 向前查找包含该指数数据的最近日期
@@ -3610,14 +3678,25 @@ class PtradeAPI:
         return str(getattr(self.context.g, "business_type", "stock")).upper()
 
     @validate_lifecycle
-    def get_cb_list(self) -> None:
-        """获取可转债市场代码表（当前本地回测不支持可转债交易接口）"""
-        self._unsupported_api("get_cb_list", "可转债交易接口")
+    def get_cb_list(self) -> list[str]:
+        """当前仍在市的可转债代码。沪市 11、深市 12，不含转债指数。"""
+        frame = self._instrument_frame()
+        if frame is None:
+            return []
+        names, codes = self._names_and_codes(frame)
+        mask = codes.str.startswith(("11", "12")) & ~names.str.contains("指数")
+        return self._active_symbols(mask, None)
 
     @validate_lifecycle
-    def get_etf_list(self) -> None:
-        """获取ETF代码列表（当前本地回测不支持ETF交易接口）"""
-        self._unsupported_api("get_etf_list", "ETF交易接口")
+    def get_etf_list(self) -> list[str]:
+        """当前仍在市的 ETF 代码。LOF 和 REITs 不在这个列表里。"""
+        frame = self._instrument_frame()
+        if frame is None:
+            return []
+        names, codes = self._names_and_codes(frame)
+        upper = names.str.upper()
+        mask = (upper.str.contains("ETF") | codes.str.startswith(("51", "56", "58", "159"))) & ~upper.str.contains("REIT")
+        return self._active_symbols(mask, None)
 
     @validate_lifecycle
     def get_ipo_stocks(self) -> None:
@@ -3851,3 +3930,10 @@ class PtradeAPI:
         self._sorted_index_dates = None
         self._adj_alignment_cache.clear()
         self._values_cache.clear()
+
+
+# PTrade 官方同时支持全称尾缀（XSHG/XSHE/XBHS）与简称尾缀（SS/SZ），
+# 且返回对象的 symbol 用四位尾缀并要求「做代码尾缀兼容」（api_doc L243-248、
+# L3084、L4241、L6342）。这里在类级别统一安装，使策略可直接沿用线上写法，
+# 不必为了本地回测把 XSHG 改成 SS。
+install_code_compat(PtradeAPI, _API_KWARG_ALIASES)

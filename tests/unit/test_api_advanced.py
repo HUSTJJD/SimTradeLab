@@ -14,6 +14,43 @@ from datetime import date
 from simtradelab.ptrade.lifecycle_controller import LifecyclePhase
 
 
+class TestInstrumentLists:
+    """债券、ETF、REITs 按本地名称出代码表，不进 A 股池。"""
+
+    def _load(self, ptrade_api, data_context):
+        ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)
+        ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.HANDLE_DATA)
+        ptrade_api.context.current_dt = pd.Timestamp("2026-11-02")
+        data_context.stock_metadata = pd.DataFrame(
+            [
+                {"symbol": "110076.SS", "stock_name": "洪城转债", "listed_date": "2020-01-02 00:00:00", "de_listed_date": "2900-01-01", "security_type": "bond"},
+                {"symbol": "000832.SS", "stock_name": "中证转债", "listed_date": "2010-01-04 00:00:00", "de_listed_date": "2900-01-01", "security_type": "bond"},
+                {"symbol": "510050.SS", "stock_name": "上证50ETF华夏", "listed_date": "2005-02-23 00:00:00", "de_listed_date": "2900-01-01", "security_type": "fund"},
+                {"symbol": "510210.SS", "stock_name": "上证指数ETF富国", "listed_date": "2011-01-04 00:00:00", "de_listed_date": "2900-01-01", "security_type": "index"},
+                {"symbol": "501302.SS", "stock_name": "恒生指数基金LOF", "listed_date": "2018-01-02 00:00:00", "de_listed_date": "2900-01-01", "security_type": "fund"},
+                {"symbol": "508000.SS", "stock_name": "华安张江产业园REIT", "listed_date": "2021-06-21 00:00:00", "de_listed_date": "2900-01-01", "security_type": "fund"},
+                {"symbol": "508099.SS", "stock_name": "未上市REIT", "listed_date": "2099-01-01 00:00:00", "de_listed_date": "2900-01-01", "security_type": "fund"},
+                {"symbol": "600000.SS", "stock_name": "浦发银行", "listed_date": "1999-11-10 00:00:00", "de_listed_date": "2900-01-01", "security_type": "stock"},
+            ]
+        ).set_index("symbol")
+
+    def test_cb_etf_and_reit_lists(self, ptrade_api, data_context):
+        self._load(ptrade_api, data_context)
+
+        assert ptrade_api.get_cb_list() == ["110076.SS"]
+        assert ptrade_api.get_etf_list() == ["510050.SS", "510210.SS"]
+        assert ptrade_api.get_reits_list() == ["508000.SS"]
+        assert ptrade_api.get_reits_list("2020-01-01") == []
+        assert ptrade_api.get_Ashares() == ["600000.SS"]
+
+        info = ptrade_api.get_cb_info()
+        assert info["bond_code"].tolist() == ["110076.SS"]
+        assert info.loc[0, "bond_name"] == "洪城转债"
+        assert info.loc[0, "list_date"] == "2020-01-02"
+        assert pd.isna(info.loc[0, "convert_price"])
+        assert pd.isna(info.loc[0, "premium_rate"])
+
+
 class TestGetAsharesAPI:
     """测试get_Ashares API"""
 
