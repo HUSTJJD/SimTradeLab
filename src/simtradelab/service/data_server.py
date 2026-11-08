@@ -231,9 +231,12 @@ class DataServer:
         # 股票价格（日线）
         if 'price' in required_data:
             print(t("data.price_loading", count=len(self._stock_keys_cache)))
+            # 按股票池惰性加载：一次回测通常只用几十只股票，全量预加载
+            # 23719 个 parquet 会固定消耗约 80 秒与数 GB 内存。API 入口会
+            # 用 ensure_loaded() 一次并行预热实际请求的股票池。
             self.stock_data_dict = LazyDataDict(
                 self.data_path, 'stock', self._stock_keys_cache,
-                preload=True
+                preload=False, skip_empty=True
             )
 
             # 立即填充 benchmark_data（确保默认基准可用）
@@ -241,8 +244,6 @@ class DataServer:
                 self._default_benchmark not in self.benchmark_data
                 and self._default_benchmark in self._stock_keys_cache
             ):
-                # 注意：这里不能用 self.stock_data_dict[...]，因为数据还在加载中
-                # 直接从storage加载，等preload完成后benchmark_data会被更新
                 self.benchmark_data[self._default_benchmark] = storage.load_stock(self.data_path, self._default_benchmark)
         else:
             print(t("data.price_skip"))
@@ -253,7 +254,7 @@ class DataServer:
             print(t("data.minute_loading", count=len(self._stock_1m_keys_cache)))
             self.stock_data_dict_1m = LazyDataDict(
                 self.data_path, 'stock_1m', self._stock_1m_keys_cache,
-                preload=True
+                preload=False, skip_empty=True
             )
         else:
             # 延迟加载模式
@@ -270,7 +271,7 @@ class DataServer:
             print(t("data.valuation_loading", count=len(self._valuation_keys_cache)))
             self.valuation_dict = LazyDataDict(
                 self.data_path, 'valuation', self._valuation_keys_cache,
-                preload=True
+                preload=False, skip_empty=True
             )
         else:
             print(t("data.valuation_skip"))
@@ -380,13 +381,15 @@ class DataServer:
         if 'price' in missing and self._stock_keys_cache is not None:
             print(t("data.supplement_price", count=len(self._stock_keys_cache)))
             self.stock_data_dict = LazyDataDict(
-                self.data_path, 'stock', self._stock_keys_cache, preload=True
+                self.data_path, 'stock', self._stock_keys_cache,
+                preload=False, skip_empty=True
             )
 
         if 'valuation' in missing and self._valuation_keys_cache is not None:
             print(t("data.supplement_valuation", count=len(self._valuation_keys_cache)))
             self.valuation_dict = LazyDataDict(
-                self.data_path, 'valuation', self._valuation_keys_cache, preload=True
+                self.data_path, 'valuation', self._valuation_keys_cache,
+                preload=False, skip_empty=True
             )
 
         if 'fundamentals' in missing and self._fundamentals_keys_cache is not None:
@@ -411,7 +414,7 @@ class DataServer:
             print(t("data.supplement_minute", count=len(self._stock_1m_keys_cache)))
             self.stock_data_dict_1m = LazyDataDict(
                 self.data_path, 'stock_1m', self._stock_1m_keys_cache,
-                preload=True
+                preload=False, skip_empty=True
             )
 
         if {'price', 'exrights'} & missing:
