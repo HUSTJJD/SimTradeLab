@@ -56,6 +56,7 @@ class BatchBacktestRunner:
                 enable_charts=batch_config.enable_charts,
                 enable_export=batch_config.enable_export,
                 enable_logging=False,
+                optimization_mode=True,
             )
             report = self._runner.run(config)
             if report:

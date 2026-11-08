@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import warnings
 import weakref
+from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -108,7 +109,13 @@ def test_daily_date_index_normalizes_non_ns_datetime_index(data_context, simple_
     date_dict, sorted_i8 = api.get_stock_date_index(stock)
     query_value = pd.Timestamp("2024-01-02").value
 
-    assert stock_df.index.dtype == np.dtype("datetime64[us]")
+    # pandas 1.5 会把任何 datetime64[us] 索引强制为 datetime64[ns]，
+    # pandas 2.x 则保留非 ns 精度；两种情况都必须被 prebuild_date_index
+    # 归一化为 ns 语义的日期索引（下面用 Timestamp.value 的 ns 值校验）。
+    assert stock_df.index.dtype in (
+        np.dtype("datetime64[ns]"),
+        np.dtype("datetime64[us]"),
+    )
     assert sorted_i8[1] == query_value
     assert date_dict[query_value] == 1
     assert api._resolve_daily_index(stock, stock_df, pd.Timestamp("2024-01-02")) == 1
@@ -149,17 +156,20 @@ def test_get_price_multi_stock_panel_contract_unchanged_by_prebuild(data_context
         stocks=["600000.SH", "000001.SZ"],
     )
 
-    assert isinstance(result, PtradeAPI.PanelLike)
-    assert list(result.keys()) == ["open", "close"]
-    assert list(result["open"].columns) == ["600000.SH", "000001.SZ"]
-    assert list(result["open"].index) == list(pd.date_range("2024-01-02", periods=3, freq="D"))
-    expected_open = pd.DataFrame(
-        {
-            "600000.SH": _source_slice(data_context, "600000.SH", "2024-01-02", "2024-01-04", ["open"])["open"],
-            "000001.SZ": _source_slice(data_context, "000001.SZ", "2024-01-02", "2024-01-04", ["open"])["open"],
-        }
-    )
-    _assert_market_frame_equal(result["open"], expected_open)
+    # 函数名沿袭历史（旧口径为 PanelLike）；Python 3.11 口径下多股票
+    # 统一返回 DataFrame，列索引为 code + 行情字段，行按股票分组。
+    assert isinstance(result, pd.DataFrame)
+    assert list(result.columns) == ["code", "open", "close"]
+    dates = list(pd.date_range("2024-01-02", periods=3, freq="D"))
+    assert list(result.index) == dates * 2
+    assert result["code"].tolist() == ["600000.SH"] * 3 + ["000001.SZ"] * 3
+    for field in ("open", "close"):
+        for stock in ("600000.SH", "000001.SZ"):
+            expected = _source_slice(data_context, stock, "2024-01-02", "2024-01-04", [field])[field]
+            np.testing.assert_allclose(
+                result.loc[result["code"] == stock, field].to_numpy(),
+                expected.to_numpy(),
+            )
 
 
 def test_get_price_multi_stock_single_field_contract_unchanged_by_prebuild(data_context, simple_log):
@@ -182,7 +192,16 @@ def test_get_price_multi_stock_single_field_contract_unchanged_by_prebuild(data_
         }
     )
     assert isinstance(result, pd.DataFrame)
-    _assert_market_frame_equal(result, expected_close)
+    assert list(result.columns) == ["code", "close"]
+    dates = list(pd.date_range("2024-01-02", periods=3, freq="D"))
+    assert list(result.index) == dates * 2
+    assert result["code"].tolist() == ["600000.SH"] * 3 + ["000001.SZ"] * 3
+    np.testing.assert_allclose(
+        result["close"].to_numpy(),
+        np.concatenate(
+            [expected_close[stock].to_numpy() for stock in ("600000.SH", "000001.SZ")]
+        ),
+    )
 
 
 def test_get_history_include_contract_unchanged_by_prebuild(data_context, simple_log):
@@ -233,17 +252,20 @@ def test_get_history_panel_contract_unchanged_by_prebuild(data_context, simple_l
         current_dt="2024-01-05",
     )
 
-    assert isinstance(result, PtradeAPI.PanelLike)
-    assert list(result.keys()) == ["open", "close"]
-    assert list(result["close"].columns) == ["600000.SH", "000001.SZ"]
-    assert list(result["close"].index) == list(pd.date_range("2024-01-03", periods=3, freq="D"))
-    expected_open = pd.DataFrame(
-        {
-            "600000.SH": _source_slice(data_context, "600000.SH", "2024-01-03", "2024-01-05", ["open"])["open"],
-            "000001.SZ": _source_slice(data_context, "000001.SZ", "2024-01-03", "2024-01-05", ["open"])["open"],
-        }
-    )
-    _assert_market_frame_equal(result["open"], expected_open, check_freq=False)
+    # Python 3.11 口径：多股票多字段同样是 DataFrame(code + 行情字段)，
+    # 行按股票分组；PanelLike 是文档标注「仅 python3.5 支持」的历史形态。
+    assert isinstance(result, pd.DataFrame)
+    assert list(result.columns) == ["code", "open", "close"]
+    dates = list(pd.date_range("2024-01-03", periods=3, freq="D"))
+    assert list(result.index) == dates * 2
+    assert result["code"].tolist() == ["600000.SH"] * 3 + ["000001.SZ"] * 3
+    for field in ("open", "close"):
+        for stock in ("600000.SH", "000001.SZ"):
+            expected = _source_slice(data_context, stock, "2024-01-03", "2024-01-05", [field])[field]
+            np.testing.assert_allclose(
+                result.loc[result["code"] == stock, field].to_numpy(),
+                expected.to_numpy(),
+            )
 
 
 def test_get_history_multi_stock_single_field_contract_unchanged_by_prebuild(data_context, simple_log):
@@ -262,15 +284,22 @@ def test_get_history_multi_stock_single_field_contract_unchanged_by_prebuild(dat
     )
 
     assert isinstance(result, pd.DataFrame)
-    assert list(result.columns) == ["600000.SH", "000001.SZ"]
-    assert list(result.index) == list(pd.date_range("2024-01-03", periods=3, freq="D"))
+    assert list(result.columns) == ["code", "close"]
+    dates = list(pd.date_range("2024-01-03", periods=3, freq="D"))
+    assert list(result.index) == dates * 2
+    assert result["code"].tolist() == ["600000.SH"] * 3 + ["000001.SZ"] * 3
     expected_close = pd.DataFrame(
         {
             "600000.SH": _source_slice(data_context, "600000.SH", "2024-01-03", "2024-01-05", ["close"])["close"],
             "000001.SZ": _source_slice(data_context, "000001.SZ", "2024-01-03", "2024-01-05", ["close"])["close"],
         }
     )
-    _assert_market_frame_equal(result, expected_close, check_freq=False)
+    np.testing.assert_allclose(
+        result["close"].to_numpy(),
+        np.concatenate(
+            [expected_close[stock].to_numpy() for stock in ("600000.SH", "000001.SZ")]
+        ),
+    )
 
 
 def test_get_history_is_dict_contract_unchanged_by_prebuild(data_context, simple_log):
@@ -289,9 +318,17 @@ def test_get_history_is_dict_contract_unchanged_by_prebuild(data_context, simple
         current_dt="2024-01-05",
     )
 
+    # is_dict=True 返回 OrderedDict[str, numpy structured array]：
+    # 首列 datetime(int64, YYYYMMDDHHMM)，其后依次为请求的行情字段。
+    assert isinstance(result, OrderedDict)
     assert list(result.keys()) == ["600000.SH", "000001.SZ"]
-    assert set(result["600000.SH"]) == {"close", "volume"}
-    assert len(result["600000.SH"]["close"]) == 3
+    for stock in ("600000.SH", "000001.SZ"):
+        arr = result[stock]
+        assert isinstance(arr, np.ndarray)
+        assert arr.dtype.names == ("datetime", "close", "volume")
+        assert arr["datetime"].dtype == np.dtype("int64")
+        assert arr["datetime"].tolist() == [202401030000, 202401040000, 202401050000]
+        assert len(arr) == 3
     np.testing.assert_array_equal(
         result["600000.SH"]["close"],
         _source_slice(data_context, "600000.SH", "2024-01-03", "2024-01-05", ["close"])["close"].values,
@@ -315,10 +352,11 @@ def test_legacy_ptrade_series_integer_access_does_not_warn(data_context, simple_
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", FutureWarning)
-        assert history_multi_stock["600000.SH"][-1] == expected_close
+        # 3.11 多股票口径：列索引为 code + 行情字段，整数位置访问仍不告警。
+        assert history_multi_stock["close"][-1] == expected_close
         assert history_single_stock["close"][-1] == expected_close
         assert price_single_stock["close"][-1] == expected_close
-        assert price_panel["open"]["600000.SH"][-1] == expected_open
+        assert price_panel[price_panel["code"] == "600000.SH"]["open"][-1] == expected_open
 
 
 def test_check_limit_status_contract_unchanged_by_prebuild(data_context, simple_log):

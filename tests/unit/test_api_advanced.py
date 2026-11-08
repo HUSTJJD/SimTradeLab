@@ -74,10 +74,10 @@ class TestMarketAndExrightsAPI:
 
         result = ptrade_api.get_market_list()
 
-        assert 'XSHG' in set(result['finance_mic'])
-        assert 'XSHE' in set(result['finance_mic'])
-        assert 'XSHO' in set(result['finance_mic'])
-        assert 'SHO' not in set(result['finance_mic'])
+        # api_doc.txt get_market_list 官方示例：SS / SZ / CSI / XBHS。
+        assert list(result.columns) == ["finance_mic", "finance_name"]
+        assert set(result["finance_mic"]) == {"SS", "SZ", "CSI", "XBHS"}
+        assert not ({"XSHG", "XSHE", "CCFX", "XSHO"} & set(result["finance_mic"]))
 
     def test_get_stock_exrights_accepts_int_date(self, ptrade_api, data_context):
         ptrade_api.context._lifecycle_controller.set_phase(LifecyclePhase.INITIALIZE)

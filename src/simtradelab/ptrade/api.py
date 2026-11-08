@@ -107,6 +107,22 @@ _PERIOD_FREQ_RULE = {
 _VALID_PRICE_FREQUENCIES = frozenset(["1d", *_MINUTE_FREQ_MINUTES, *_PERIOD_FREQ_RULE])
 
 
+def _ptrade_datetime_int64(index) -> np.ndarray:
+    """PTrade is_dict structured array 首列：YYYYMMDDHHMM 的 int64。
+
+    依据 api_doc.txt get_price/get_history 返回示例：
+    ``array([(201706010931, 37.1, ...), ...])`` / ``(202309220931, ...)``。
+    """
+    dt = pd.DatetimeIndex(index)
+    return (
+        dt.year.to_numpy(dtype="int64") * 10**8
+        + dt.month.to_numpy(dtype="int64") * 10**6
+        + dt.day.to_numpy(dtype="int64") * 10**4
+        + dt.hour.to_numpy(dtype="int64") * 10**2
+        + dt.minute.to_numpy(dtype="int64")
+    )
+
+
 class _TradeDaysArray(np.ndarray):
     """numpy.ndarray with list-like truthiness for legacy strategy compatibility."""
 
@@ -369,7 +385,9 @@ class PtradeAPI:
         self.context.g.broker_profile = self.broker_profile
 
         # 股票池管理
-        self.active_universe: set = set()
+        # 保序股票池（api_doc.txt: set_universe 决定 get_history 默认
+        # security_list，返回顺序应与传入顺序一致）；用 list 而非 set。
+        self.active_universe: list = []
 
         # 订单处理器（延迟初始化）
         self._order_processor: Optional[OrderProcessor] = None
@@ -419,7 +437,14 @@ class PtradeAPI:
         if self._prebuilt_index and stocks is None:
             return
 
-        target_stocks = stocks if stocks else list(self.data_context.stock_data_dict.keys())
+        source = self.data_context.stock_data_dict
+        # 测试夹具/最小化上下文可能用哨兵对象或普通 dict，缺少 keys() 时
+        # 直接退化为空列表，避免为了一个可选的性能预热把初始化打断。
+        target_stocks = (
+            stocks
+            if stocks
+            else list(source.keys()) if hasattr(source, "keys") else []
+        )
         target_stocks = [stock for stock in target_stocks if stock not in self._stock_date_index]
         print(t("api.prebuilding", count=len(target_stocks)))
 
@@ -508,13 +533,28 @@ class PtradeAPI:
             return stock_df
 
         adj_factors = adj_cache[stock]
-        common_idx = stock_df.index.intersection(adj_factors.index)
-        if len(common_idx) == 0:
-            return stock_df
+        idx = stock_df.index
+        # api_doc.txt: fq (pre/post/dypre) 对 1m~1y 全部频率均有效，
+        # 无「分钟数据不支持复权」的限制。分钟 bar 按所属交易日取因子。
+        intraday = isinstance(idx, pd.DatetimeIndex) and not idx.equals(idx.normalize())
+        if intraday:
+            aligned = adj_factors.reindex(idx.normalize()).ffill()
+            adj_a = pd.Series(aligned["adj_a"].to_numpy(), index=idx)
+            adj_b = pd.Series(aligned["adj_b"].to_numpy(), index=idx)
+            valid = adj_a.notna().to_numpy()
+            if not valid.any():
+                return stock_df
+            common_idx = idx[valid]
+            adj_a = adj_a.loc[common_idx]
+            adj_b = adj_b.loc[common_idx]
+        else:
+            common_idx = idx.intersection(adj_factors.index)
+            if len(common_idx) == 0:
+                return stock_df
+            adj_a = adj_factors.loc[common_idx, "adj_a"]
+            adj_b = adj_factors.loc[common_idx, "adj_b"]
 
         adjusted_df = stock_df.copy()
-        adj_a = adj_factors.loc[common_idx, "adj_a"]
-        adj_b = adj_factors.loc[common_idx, "adj_b"]
         price_cols = ["open", "high", "low", "close"]
         high_low_adjusted = {}
         if (
@@ -647,21 +687,26 @@ class PtradeAPI:
         else:
             end_dt = pd.Timestamp(end_date)
 
+        # 交易日历为已排序 DatetimeIndex：用 searchsorted 定位 <= end_dt 的
+        # 右边界，位置切片与全量布尔掩码逐位相同，避免构造 O(n) 掩码数组。
+        end_pos = all_trade_days.searchsorted(end_dt, side='right')
+        valid_days = all_trade_days[:end_pos]
+
         if count is not None:
             if start_date is not None:
                 raise ValueError("start_date和count不能同时使用")
             # 找到end_date的位置
-            valid_days = all_trade_days[all_trade_days <= end_dt]
             if len(valid_days) == 0:
                 return _TradeDaysArray([])
             # 往前取count个交易日（包含end_date）
             trade_days = valid_days[-count:]
         else:
             # 使用start_date和end_date范围
-            trade_days = all_trade_days[all_trade_days <= end_dt]
+            trade_days = valid_days
             if start_date is not None:
                 start_dt = pd.Timestamp(start_date)
-                trade_days = trade_days[trade_days >= start_dt]
+                start_pos = trade_days.searchsorted(start_dt, side='left')
+                trade_days = trade_days[start_pos:]
 
         return _TradeDaysArray([d.strftime("%Y-%m-%d") for d in trade_days])
 
@@ -697,14 +742,13 @@ class PtradeAPI:
             base_idx = all_trade_days.get_loc(base_date)
         else:
             if self.broker_profile == "guosheng" and day == 0:
-                valid_days = all_trade_days[all_trade_days >= base_date]
-                base_idx = all_trade_days.get_loc(valid_days[0]) if len(valid_days) else len(all_trade_days)
+                # >= base_date 的第一个位置（side='left'），与布尔掩码逐位相同
+                pos = all_trade_days.searchsorted(base_date, side='left')
+                base_idx = pos if pos < len(all_trade_days) else len(all_trade_days)
             else:
-                valid_days = all_trade_days[all_trade_days <= base_date]
-                if len(valid_days) == 0:
-                    base_idx = 0
-                else:
-                    base_idx = all_trade_days.get_loc(valid_days[-1])
+                # <= base_date 的右边界；最后一个可用交易日即 pos-1
+                pos = all_trade_days.searchsorted(base_date, side='right')
+                base_idx = pos - 1 if pos > 0 else 0
 
         target_idx = base_idx + day
 
@@ -729,10 +773,10 @@ class PtradeAPI:
         if base_date in all_trade_days:
             base_idx = all_trade_days.get_loc(base_date)
         else:
-            valid_days = all_trade_days[all_trade_days <= base_date]
-            if len(valid_days) == 0:
+            pos = all_trade_days.searchsorted(base_date, side='right')
+            if pos == 0:
                 return None
-            base_idx = all_trade_days.get_loc(valid_days[-1])
+            base_idx = pos - 1
 
         target_idx = base_idx + day
         if target_idx < 0 or target_idx >= len(all_trade_days):
@@ -742,12 +786,15 @@ class PtradeAPI:
     @validate_lifecycle
     def get_market_list(self) -> pd.DataFrame:
         """获取市场列表（回测简化版）"""
+        # api_doc.txt get_market_list() 官方返回示例（QTV202401.05.021：
+        # 仅返回系统支持的四个市场）：SS / SZ / CSI / XBHS。
+        # XSHG/XSHE/CCFX/XSHO 是旧版别的口径，不是国泰海通客户端返回值。
         return pd.DataFrame(
             [
-                {"finance_mic": "XSHG", "finance_name": "上海证券交易所"},
-                {"finance_mic": "XSHE", "finance_name": "深圳证券交易所"},
-                {"finance_mic": "CCFX", "finance_name": "中国金融期货交易所"},
-                {"finance_mic": "XSHO", "finance_name": "上海个股期权"},
+                {"finance_mic": "SS", "finance_name": "上海证券交易所"},
+                {"finance_mic": "SZ", "finance_name": "深圳证券交易所"},
+                {"finance_mic": "CSI", "finance_name": "中证指数"},
+                {"finance_mic": "XBHS", "finance_name": "沪深板块"},
             ]
         )
 
@@ -961,11 +1008,33 @@ class PtradeAPI:
 
             data_dict = self.data_context.fundamentals_dict
 
-        # 如果未指定date，使用回测当前日期
+        # api_doc.txt get_fundamentals：「不传入date时默认取回测日期的
+        # 上一个交易日数据」；fundamentals_doc.txt 同（前一交易日估值）。
+        # 旧实现取当天，会引入未来函数。
         if date is None:
-            query_ts = self.context.current_dt
+            query_ts = pd.Timestamp(self.context.current_dt)
+            trade_days = self.data_context.trade_days
+            if trade_days is not None and len(trade_days):
+                pos = int(pd.DatetimeIndex(trade_days).searchsorted(query_ts.normalize(), side="left"))
+                if pos > 0:
+                    query_ts = pd.DatetimeIndex(trade_days)[pos - 1]
         else:
             query_ts = pd.Timestamp(date)
+            # fundamentals_doc.txt 场景二：回测/交易中 date 为非交易日时，
+            # 返回字段全为 NAN 的数据（研究环境才回退到最近交易日）。
+            trade_days = pd.DatetimeIndex(self.data_context.trade_days) if self.data_context.trade_days is not None else None
+            if trade_days is not None and len(trade_days):
+                day = query_ts.normalize()
+                # 仅在交易日历确实覆盖该日期时才判定「非交易日」；
+                # 日历不完整（如测试夹具只覆盖局部区间）或查询未来日期时
+                # 不误判成非交易日，避免把合法查询静默变成全 NaN。
+                in_range = trade_days[0] <= day <= trade_days[-1]
+                if in_range and trade_days.get_indexer([day])[0] < 0:
+                    return _PTradeDataFrame(
+                        np.full((len(stocks), len(fields)), np.nan),
+                        index=pd.Index(stocks, name="secu_code"),
+                        columns=list(fields),
+                    )
         if start_year is not None or end_year is not None:
             if table == "valuation":
                 raise ValueError("valuation 只支持按日查询，不接受 start_year/end_year")
@@ -1319,6 +1388,20 @@ class PtradeAPI:
                 df = self._aggregate_intraday_kline(
                     df, _MINUTE_FREQ_MINUTES[frequency]
                 )
+            # api_doc.txt: fq 对 1m~120m 同样有效，旧实现在分钟频静默忽略复权。
+            if fq in ("pre", "post"):
+                df = self._apply_adj_factors(df, stock, fq)
+            elif fq == "dypre":
+                df = self._apply_adj_factors(df, stock, "pre")
+                cache = self.data_context.adj_pre_cache
+                if cache and stock in cache and isinstance(df.index, pd.DatetimeIndex) and len(df):
+                    aligned = cache[stock].reindex(df.index.normalize()).ffill()
+                    a_base = float(aligned["adj_a"].iloc[-1])
+                    b_base = float(aligned["adj_b"].iloc[-1])
+                    if a_base and np.isfinite(a_base) and np.isfinite(b_base):
+                        for col in ("open", "high", "low", "close"):
+                            if col in df.columns:
+                                df[col] = (df[col].to_numpy(dtype=float) - b_base) / a_base
             return storage.ensure_alias_columns(df)
 
         if frequency in _PERIOD_FREQ_RULE:
@@ -1385,7 +1468,7 @@ class PtradeAPI:
         """Build the logical intraday bar index ending at the effective cutoff."""
         if self.data_context.trade_days is not None:
             days = pd.DatetimeIndex(self.data_context.trade_days)
-            days = days[days <= current_dt.normalize()]
+            days = days[:days.searchsorted(current_dt.normalize(), side='right')]
         else:
             days = pd.DatetimeIndex([current_dt.normalize()])
         sample_day = current_dt.normalize()
@@ -1423,11 +1506,40 @@ class PtradeAPI:
             )
         if not session_parts:
             return pd.DatetimeIndex([])
-        target = session_parts[0]
-        for part in session_parts[1:]:
-            target = target.append(part)
-        target = target[target <= current_dt] if include else target[target < current_dt]
-        return target[-count:]
+        # append 循环是 O(n²)：一次性拼接各段时间点，序列逐元素保持不变。
+        target = pd.DatetimeIndex(np.concatenate([part.values for part in session_parts]))
+        cutoff_pos = target.searchsorted(current_dt, side='right' if include else 'left')
+        return target[:cutoff_pos][-count:]
+
+    def _ensure_market_data(self, stocks) -> None:
+        """一次性并行预热本次请求涉及的行情与复权因子。
+
+        stock_data_dict / adj_*_cache 已改为按需加载：若不在入口批量预热，
+        主循环里逐只 ``__getitem__`` 会退化成单线程逐个读 parquet。这里对
+        尚未预热过的股票调用一次 ``ensure_loaded``（线程池 + parquet
+        filters 下推），后续所有访问都命中内存缓存。
+        """
+        if not stocks:
+            return
+        warmed = getattr(self, "_warmed_stocks", None)
+        if warmed is None:
+            warmed = self._warmed_stocks = set()
+        new = [s for s in dict.fromkeys(stocks) if s not in warmed]
+        if not new:
+            return
+        # 策略可写 XSHG/XSHE 等官方全称尾缀，而数据包内部只用 .SS/.SZ；
+        # 展开等价写法才能让预热命中真实键，避免退化成逐只惰性加载。
+        expanded = list(dict.fromkeys(
+            candidate for s in new for candidate in code_candidates(s)
+        ))
+        source = getattr(self.data_context, "stock_data_dict", None)
+        if source is not None and hasattr(source, "ensure_loaded"):
+            source.ensure_loaded(expanded)
+        for cache in (getattr(self.data_context, "adj_pre_cache", None),
+                      getattr(self.data_context, "adj_post_cache", None)):
+            if cache is not None and hasattr(cache, "ensure_loaded"):
+                cache.ensure_loaded(expanded)
+        warmed.update(new)
 
     def get_price(
         self,
@@ -1468,18 +1580,29 @@ class PtradeAPI:
         if isinstance(fields, str):
             fields_list = [fields]
         elif fields is None:
-            fields_list = ["open", "high", "low", "close", "volume", "money", "price"]
+            # 国泰海通 api_doc.txt get_price: fields=None 返回 12 列（含
+            # is_open / preclose / high_limit / low_limit / unlimited）。
+            # 旧实现只给 7 列，按文档编写的策略会取不到扩展字段。
+            fields_list = [
+                "open", "high", "low", "close", "volume", "money", "price",
+                "is_open", "preclose", "high_limit", "low_limit", "unlimited",
+            ]
         else:
-            fields_list = fields
+            fields_list = list(fields)
 
         if profile in ("guosheng", "dongguan") and "is_open" in fields_list:
             raise ValueError(t("api.get_price_unsupported_field", profile=profile, field_name="is_open"))
 
         is_single_stock = isinstance(security, str)
         stocks = [security] if is_single_stock else security
+        self._ensure_market_data(stocks)
 
         if count is not None:
             end_dt = pd.Timestamp(end_date) if end_date else pd.Timestamp(self.context.current_dt)
+            # api_doc.txt get_price: "数据返回内容不包括当天数据"。未显式传
+            # end_date 时以回测当日为界，日线需回退到上一交易日末。
+            if end_date is None and frequency == "1d":
+                end_dt = end_dt.normalize() - pd.Timedelta(nanoseconds=1)
             result = {}
             for stock in stocks:
                 stock_df = self._get_stock_df_by_frequency(stock, frequency, fq=fq, base_dt=end_dt)
@@ -1513,7 +1636,9 @@ class PtradeAPI:
                 result[stock] = slice_df
         else:
             start_dt = pd.Timestamp(start_date) if start_date else None
-            end_dt = pd.Timestamp(end_date) if end_date else self.context.current_dt
+            end_dt = pd.Timestamp(end_date) if end_date else pd.Timestamp(self.context.current_dt)
+            if end_date is None and frequency == "1d":
+                end_dt = end_dt.normalize() - pd.Timedelta(nanoseconds=1)
 
             result = {}
             for stock in stocks:
@@ -1562,62 +1687,64 @@ class PtradeAPI:
 
         if not result:
             self.log.warning(t("api.get_price_empty", stocks=security, frequency=frequency, fq=fq))
-            if is_dict and profile == "shanxi":
-                return None
-            return OrderedDict() if is_dict else _PTradeDataFrame()
+            # api_doc.txt: 「正常返回dict类型数据，异常时返回None(NoneType)」；
+            # QTV202401.05.013 明确把空字典改为 None。旧实现只在 shanxi 档
+            # 返回 None，默认 auto 档返回空 OrderedDict，与平台语义相反。
+            return None
 
         if is_dict:
             out = OrderedDict()
             for stock in stocks:
                 stock_df = result.get(stock)
-                if stock_df is None:
+                if stock_df is None or stock_df.empty:
                     continue
                 selected_fields = [f for f in fields_list if f in stock_df.columns]
-                selected = stock_df[selected_fields] if len(fields_list) > 0 else stock_df
-                dtype_items = []
+                selected = stock_df[selected_fields] if selected_fields else stock_df
+                # 文档要求首列为 datetime int64 (YYYYMMDDHHMM)，其后为行情字段。
+                dtype_items = [("datetime", "<i8")]
                 for f in selected.columns:
-                    if profile == "shanxi" and f == "unlimited":
-                        dtype_items.append((f, "<i8"))
-                    else:
-                        dtype_items.append((f, "<f8"))
+                    dtype_items.append((f, "<i8" if f in ("is_open", "unlimited") else "<f8"))
                 arr = np.empty(len(selected), dtype=dtype_items)
+                arr["datetime"] = _ptrade_datetime_int64(selected.index)
                 for f in selected.columns:
-                    if profile == "shanxi" and f == "unlimited":
-                        arr[f] = selected[f].astype("int64").values
+                    if f in ("is_open", "unlimited"):
+                        arr[f] = np.nan_to_num(
+                            selected[f].to_numpy(dtype="float64", na_value=np.nan), nan=0.0
+                        ).astype("int64")
                     else:
-                        arr[f] = selected[f].values
+                        arr[f] = selected[f].to_numpy(dtype="float64", na_value=np.nan)
                 out[stock] = arr
-            return out
+            return out if out else None
 
         if is_single_stock:
             stock_df = result.get(security)
             if stock_df is None:
                 self.log.warning(t("api.get_price_no_data", stock=security, frequency=frequency, fq=fq))
-                return _PTradeDataFrame()
+                return None
             selected_fields = [f for f in fields_list if f in stock_df.columns]
-            ret = stock_df[selected_fields] if len(fields_list) > 0 else stock_df
+            ret = stock_df[selected_fields] if selected_fields else stock_df
             if profile == "shanxi" and "unlimited" in ret.columns:
                 ret = ret.copy()
                 ret["unlimited"] = ret["unlimited"].astype("int64")
             return _PTradeDataFrame(ret)
 
-        if len(fields_list) == 1:
-            field_name = fields_list[0]
-            data = {stock: stock_df[field_name] for stock, stock_df in result.items() if field_name in stock_df.columns}
-            ret = _PTradeDataFrame(data) if data else _PTradeDataFrame()
-            if profile == "shanxi" and field_name == "unlimited" and not ret.empty:
-                ret = ret.astype("int64")
-            return ret
-
-        panel_data = {}
-        for field_name in fields_list:
-            data = {stock: stock_df[field_name] for stock, stock_df in result.items() if field_name in stock_df.columns}
-            df = _PTradeDataFrame(data)
-            if profile == "shanxi" and field_name == "unlimited" and not df.empty:
-                df = df.astype("int64")
-            panel_data[field_name] = df
-
-        return self.PanelLike(panel_data)
+        # Python 3.11 口径（api_doc.txt「仅python3.11版本支持 第二种返回数据」）：
+        # 多股票无论单/多字段，均返回 DataFrame，列索引为 code + 行情字段。
+        # 「列=股票代码」与 pandas.Panel 是文档标注「仅 python3.5 支持」的历史形态。
+        frames = []
+        for stock in stocks:
+            stock_df = result.get(stock)
+            if stock_df is None or stock_df.empty:
+                continue
+            selected_fields = [f for f in fields_list if f in stock_df.columns]
+            if not selected_fields:
+                continue
+            part = stock_df[selected_fields].copy()
+            part.insert(0, "code", stock)
+            frames.append(part)
+        if not frames:
+            return None
+        return _PTradeDataFrame(pd.concat(frames))
 
     @validate_lifecycle
     def get_trend_data(
@@ -1848,9 +1975,10 @@ class PtradeAPI:
         if isinstance(stocks, str):
             stocks = [stocks]
 
-        # 批量快速返回空结果
+        # 批量快速返回空结果（api_doc.txt: 异常时返回 None）
         if not stocks:
-            return {} if is_dict else pd.DataFrame()
+            return None
+        self._ensure_market_data(stocks)
 
         current_dt = pd.Timestamp(self.context.current_dt)
         query_date = current_dt.normalize()
@@ -1935,7 +2063,8 @@ class PtradeAPI:
         if frequency == "1d" and self.data_context.trade_days is not None:
             calendar = pd.DatetimeIndex(self.data_context.trade_days)
             cutoff = current_dt.normalize()
-            valid_dates = calendar[calendar <= cutoff] if include else calendar[calendar < cutoff]
+            cutoff_pos = calendar.searchsorted(cutoff, side='right' if include else 'left')
+            valid_dates = calendar[:cutoff_pos]
             daily_target_dates = valid_dates[-count:]
             target_ns = _datetime_index_ns(daily_target_dates)
 
@@ -2080,22 +2209,45 @@ class PtradeAPI:
             if stock_result:
                 result[stock] = stock_result
 
-        # ── 转换为返回格式（与 ptrade 对齐）──
+        # ── 转换为返回格式（国泰海通 api_doc.txt / Python 3.11 口径）──
         if not result:
             self.log.warning(t("api.get_history_empty", stocks=security_list, count=count, frequency=frequency, fq=fq))
-            final_result = {} if is_dict else _PTradeDataFrame()
+            # api_doc.txt: 「正常返回dict类型数据，异常时返回None(NoneType)」
+            final_result = None
         elif is_dict:
-            # 兼容历史测试契约：{stock: {field: ndarray}}
+            # 文档: OrderedDict[str, numpy structured array]，
+            # 首列 datetime(int64, YYYYMMDDHHMM)，其后依次为请求的行情字段。
             final_result = OrderedDict()
             for stock in stocks:
-                if stock in result:
-                    final_result[stock] = result[stock]
+                if stock not in result:
+                    continue
+                cols = [f for f in fields if f in result[stock]]
+                if not cols:
+                    continue
+                n = len(result[stock][cols[0]])
+                dtype_items = [("datetime", "<i8")] + [
+                    (f, "<i8" if f in ("is_open", "unlimited") else "<f8") for f in cols
+                ]
+                arr = np.empty(n, dtype=dtype_items)
+                dates = result_dates.get(stock)
+                arr["datetime"] = (
+                    _ptrade_datetime_int64(dates) if dates is not None and len(dates) == n else 0
+                )
+                for f in cols:
+                    vals = np.asarray(result[stock][f])
+                    if f in ("is_open", "unlimited"):
+                        arr[f] = np.nan_to_num(vals.astype("float64"), nan=0.0).astype("int64")
+                    else:
+                        arr[f] = vals.astype("float64", copy=False)
+                final_result[stock] = arr
+            if not final_result:
+                final_result = None
         else:
             stocks_list = [security_list] if is_single_stock else stocks
 
             if is_single_stock:
                 if stocks_list[0] not in result:
-                    final_result = _PTradeDataFrame()
+                    final_result = None
                 else:
                     stock_dates = result_dates.get(stocks_list[0])
                     df_data = {
@@ -2139,96 +2291,24 @@ class PtradeAPI:
                         final_result.columns, names=["field", "code"]
                     )
 
-            elif len(fields) == 1:
-                field_name = fields[0]
-                all_dates = {stock: result_dates[stock] for stock in stocks_list if stock in result_dates}
-                ref_dates = all_dates[max(all_dates, key=lambda s: len(all_dates[s]))] if all_dates else None
-                if ref_dates is not None:
-                    df_data = {}
-                    ref_index = ref_dates.to_pydatetime()
-                    for stock in stocks_list:
-                        if stock not in result or field_name not in result[stock]:
-                            continue
-                        stock_dates = result_dates.get(stock)
-                        vals = result[stock][field_name]
-                        if stock_dates is not None:
-                            series = pd.Series(vals, index=stock_dates.to_pydatetime()).reindex(ref_index)
-                            if fill == "pre":
-                                series = series.ffill().bfill()
-                            df_data[stock] = series.values
-                        else:
-                            df_data[stock] = vals
-                else:
-                    df_data = {
-                        stock: result[stock][field_name]
-                        for stock in stocks_list
-                        if stock in result and field_name in result[stock]
-                    }
-                if field_name == "unlimited":
-                    target_dtype = "int64" if profile == "shanxi" else "float64"
-                    df_data = {k: v.astype(target_dtype, copy=False) for k, v in df_data.items()}
-                # Newly-listed stocks may have fewer bars than count;
-                # left-pad with NaN to align to trading calendar (PTrade convention)
-                if ref_dates is None and df_data and len(set(len(v) for v in df_data.values())) > 1:
-                    mx = max(len(v) for v in df_data.values())
-                    df_data = {
-                        k: np.concatenate(
-                            [
-                                np.full(mx - len(v), (v[0] if (fill == "pre" and len(v) > 0) else np.nan)),
-                                v.astype(float),
-                            ]
-                        )
-                        if len(v) < mx
-                        else v
-                        for k, v in df_data.items()
-                    }
-                final_result = _PTradeDataFrame(
-                    df_data,
-                    index=ref_dates.to_pydatetime() if ref_dates is not None else None,
-                )
-
             else:
-                all_dates = {stock: result_dates[stock] for stock in stocks_list if stock in result_dates}
-                ref_dates = all_dates[max(all_dates, key=lambda s: len(all_dates[s]))] if all_dates else None
-                ref_index = ref_dates.to_pydatetime() if ref_dates is not None else None
-                panel_data = {}
-                for field_name in fields:
-                    if ref_index is not None:
-                        df_data = {}
-                        for stock in stocks_list:
-                            if stock not in result or field_name not in result[stock]:
-                                continue
-                            stock_dates = result_dates.get(stock)
-                            vals = result[stock][field_name]
-                            if stock_dates is not None:
-                                series = pd.Series(vals, index=stock_dates.to_pydatetime()).reindex(ref_index)
-                                if fill == "pre":
-                                    series = series.ffill().bfill()
-                                df_data[stock] = series.values
-                            else:
-                                df_data[stock] = vals
-                    else:
-                        df_data = {
-                            stock: result[stock][field_name]
-                            for stock in stocks_list
-                            if stock in result and field_name in result[stock]
-                        }
-                    if ref_index is None and df_data and len(set(len(v) for v in df_data.values())) > 1:
-                        mx = max(len(v) for v in df_data.values())
-                        df_data = {
-                            k: np.concatenate(
-                                [
-                                    np.full(mx - len(v), (v[0] if (fill == "pre" and len(v) > 0) else np.nan)),
-                                    v.astype(float),
-                                ]
-                            )
-                            if len(v) < mx
-                            else v
-                            for k, v in df_data.items()
-                        }
-                    panel_data[field_name] = _PTradeDataFrame(df_data, index=ref_index)
-
-                final_result = self.PanelLike(panel_data)
+                # Python 3.11 口径（api_doc.txt「仅python3.11版本支持 第二种返回数据」）：
+                # 多股票无论单/多字段，均返回 DataFrame，列索引 = code + 行情字段，
+                # 行按股票分组排列。列=股票代码 / pandas.Panel 是文档标注
+                # 「仅 python3.5 版本支持」的历史形态，不再作为默认输出。
+                frames = []
+                for stock in stocks_list:
+                    if stock not in result:
+                        continue
+                    df_data = {f: result[stock][f] for f in fields if f in result[stock]}
+                    if not df_data:
+                        continue
+                    stock_dates = result_dates.get(stock)
+                    idx = stock_dates.to_pydatetime() if stock_dates is not None else None
+                    part = _PTradeDataFrame(df_data, index=idx)
+                    part.insert(0, "code", stock)
+                    frames.append(part)
+                final_result = _PTradeDataFrame(pd.concat(frames)) if frames else None
 
         # 券商差异：unlimited 返回类型（shanxi=int64, 其他=float64）
         if isinstance(final_result, pd.DataFrame) and not final_result.empty:
@@ -2563,13 +2643,25 @@ class PtradeAPI:
                 current_low = stock_df["low"].values[idx]
                 prev_close = stock_df["close"].values[idx - 1]
 
-                if np.isnan(prev_close) or prev_close <= 0:  # type: ignore
-                    result[stock] = status
-                    continue
+                # api_doc.txt: high_limit / low_limit 是交易所下发的真实
+                # 涨跌停价（含 ST ±5%、新股无限制、板块/日期规则）。优先读
+                # 数据快照，避免引擎侧与导出侧各按固定比例算一套而互相矛盾；
+                # 仅当快照缺失时才回退到按 preclose 推算。
+                limit_up_price = None
+                limit_down_price = None
+                if "high_limit" in stock_df.columns and "low_limit" in stock_df.columns:
+                    hl = stock_df["high_limit"].values[idx]
+                    ll = stock_df["low_limit"].values[idx]
+                    if not np.isnan(hl) and not np.isnan(ll) and hl > 0 and ll > 0:
+                        limit_up_price, limit_down_price = float(hl), float(ll)
 
-                limit_ratio = self._get_price_limit_ratio(stock)
-                limit_up_price = prev_close * (1 + limit_ratio)
-                limit_down_price = prev_close * (1 - limit_ratio)
+                if limit_up_price is None:
+                    if np.isnan(prev_close) or prev_close <= 0:  # type: ignore
+                        result[stock] = status
+                        continue
+                    limit_ratio = self._get_price_limit_ratio(stock)
+                    limit_up_price = prev_close * (1 + limit_ratio)
+                    limit_down_price = prev_close * (1 - limit_ratio)
 
                 # 回测中不能使用当天收盘价判断涨停（会产生未来数据泄露）
                 # 只检查一字涨停（开盘=最高=最低=涨停价）
@@ -3425,21 +3517,17 @@ class PtradeAPI:
     def set_universe(self, security_list: str | list[str]) -> None:
         """设置股票池并预加载数据"""
         stocks = security_list
-        if isinstance(stocks, list):
-            new_stocks = set(stocks)
-            to_preload = new_stocks - self.active_universe
-            if to_preload:
-                self.log.debug(f"预加载 {len(to_preload)} 只新股票数据")
-                for stock in to_preload:
-                    if stock in self.data_context.stock_data_dict:
-                        _ = self.data_context.stock_data_dict[stock]
-            self.active_universe = new_stocks
-            self.log.debug(f"股票池更新: {len(self.active_universe)} 只")
-        else:
-            self.active_universe = set([stocks])
-            if stocks in self.data_context.stock_data_dict:
-                _ = self.data_context.stock_data_dict[stocks]
-            self.log.debug(f"设置股票池: {stocks}")
+        # api_doc.txt: set_universe 用于设定 get_history 的默认 security_list，
+        # 返回顺序与传入股票池一致。旧实现用 set 存储，hash 随机化会让
+        # 多股票结果的列/行顺序不可复现。
+        ordered = list(dict.fromkeys(stocks if isinstance(stocks, list) else [stocks]))
+        previous = set(self.active_universe)
+        to_preload = [s for s in ordered if s not in previous]
+        if to_preload:
+            self.log.debug(f"预加载 {len(to_preload)} 只新股票数据")
+            self._ensure_market_data(to_preload)
+        self.active_universe = ordered
+        self.log.debug(f"股票池更新: {len(self.active_universe)} 只")
 
     def is_trade(self) -> bool:
         """是否实盘"""

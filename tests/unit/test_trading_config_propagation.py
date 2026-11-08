@@ -153,7 +153,11 @@ def _production_reads_field_anywhere(field: str) -> bool:
 
 def _trading_config_contract_errors(contracts):
     errors = []
-    if set(contracts) != set(TradingConfig.model_fields):
+    # pydantic v2 用 model_fields，v1 用 __fields__。
+    trading_config_fields = (
+        getattr(TradingConfig, "model_fields", None) or TradingConfig.__fields__
+    )
+    if set(contracts) != set(trading_config_fields):
         errors.append("contract fields do not match TradingConfig fields")
     for field, contract in contracts.items():
         setter = contract.get("public_setter")

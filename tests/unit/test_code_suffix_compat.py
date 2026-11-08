@@ -171,8 +171,14 @@ class TestAPIAcceptsOfficialLongSuffixes:
         assert api.get_position(SH_LONG).amount == 100
         assert SH_LONG in api.get_positions([SH_LONG])
 
-        # data['600000.XSHG'] 不走 API 方法，必须自己解析到内部 .SS 键
-        bar_data = Data(context.current_dt, SimpleNamespace(stock_data_dict=api.data_context.stock_data_dict))
+        # data['600000.XSHG'] 不走 API 方法，必须自己解析到内部 .SS 键。
+        # StockData 初始化会读取日期索引，补齐 bt_ctx 的最小契约。
+        bt_ctx = SimpleNamespace(
+            stock_data_dict=api.data_context.stock_data_dict,
+            get_stock_date_index=lambda stock: ({}, np.array([], dtype="i8")),
+            context=None,
+        )
+        bar_data = Data(context.current_dt, bt_ctx)
         assert bar_data[SH_LONG].stock == SH_STOCK
         assert bar_data[SH_LONG]._stock_df is api.data_context.stock_data_dict[SH_STOCK]
 

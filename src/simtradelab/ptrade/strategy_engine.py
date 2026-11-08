@@ -58,6 +58,20 @@ def _build_safe_builtins() -> dict:
 _SAFE_BUILTINS = _build_safe_builtins()
 
 
+def _coerce_exrights_date_int(value):
+    """把 exrights_df.index 元素映射为 int 日期键。
+
+    与 `date_int in exrights_df.index` 的语义对齐：只有数值日期才可能被
+    int 型 date_int 命中；字符串/布尔/时间对象返回 None。
+    """
+    if isinstance(value, (bool, str, bytes)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 class StrategyExecutionError(Exception):
     """策略执行错误"""
     pass
@@ -108,6 +122,12 @@ class StrategyExecutionEngine:
         self._strategy_functions: dict[str, Callable[..., Any]] = {}
         self._strategy_name: Optional[str] = None
         self._is_running = False
+
+        # 分红/除权事件按日期倒排索引：{date_str: {有事件的股票}}。
+        # 增量构建，只索引实际出现过的持仓股票，避免一次性全市场加载
+        # LazyDataDict（exrights_dict / dividend_cache 均为按需加载）。
+        self._dividend_index: Optional[dict[str, set[str]]] = None
+        self._dividend_indexed_stocks: Optional[set[str]] = None
     # ==========================================
     # 策略注册接口
     # ==========================================
@@ -605,6 +625,44 @@ class StrategyExecutionEngine:
             traceback.print_exc()
             return allow_fail
 
+    def _ensure_dividend_index(self, date_str: str, positions) -> set[str]:
+        """增量构建/维护 {date_str: {有除权或分红事件的股票}} 倒排索引。
+
+        只对「实际出现过且持股数>0」的持仓股票查询 LazyDataDict，保持与旧实现
+        相同的数据加载时机，不做全市场预加载。返回当天的事件股票集合。
+        """
+        if self._dividend_index is None:
+            self._dividend_index = {}
+            self._dividend_indexed_stocks = set()
+        dc = self.api.data_context
+        if dc.exrights_dict is None or dc.dividend_cache is None:
+            # 数据源不可用：让调用方退回逐持仓全量检查（旧行为）
+            raise ValueError("dividend data sources unavailable")
+
+        events_today = self._dividend_index.setdefault(date_str, set())
+        exrights_dict = dc.exrights_dict
+        dividend_cache = dc.dividend_cache
+        for stock_code, position in positions.items():
+            if position.amount <= 0 or stock_code in self._dividend_indexed_stocks:
+                continue
+            self._dividend_indexed_stocks.add(stock_code)
+
+            ex_df = exrights_dict.get(stock_code)
+            if ex_df is not None and not ex_df.empty:
+                for d in ex_df.index:
+                    di = _coerce_exrights_date_int(d)
+                    if di is None:
+                        continue
+                    # 所有事件日期都写入索引，后续交易日也能 O(1) 命中
+                    self._dividend_index.setdefault(str(di), set()).add(stock_code)
+
+            if stock_code in dividend_cache:
+                stock_dividends = dividend_cache[stock_code]
+                if stock_dividends:
+                    for ds in stock_dividends:
+                        self._dividend_index.setdefault(ds, set()).add(stock_code)
+        return events_today
+
     def _process_dividend_events(self, current_date):
         """处理除权除息事件
 
@@ -617,18 +675,31 @@ class StrategyExecutionEngine:
         """
         try:
             date_str = current_date.strftime('%Y%m%d')
+            date_int = int(date_str)  # 提到循环外
+            dc = self.api.data_context
+            positions = self.context.portfolio.positions
 
-            for stock_code, position in self.context.portfolio.positions.items():
+            # 当天有事件的股票集合（O(1) 取用）；索引构建失败时退回
+            # 逐持仓全量检查，保证与旧实现完全一致。
+            try:
+                events_today = self._ensure_dividend_index(date_str, positions)
+            except Exception:
+                self._dividend_index = None
+                self._dividend_indexed_stocks = None
+                events_today = None
+
+            for stock_code, position in positions.items():
                 if position.amount <= 0:
+                    continue
+                if events_today is not None and stock_code not in events_today:
                     continue
 
                 # 分红和送股都基于登记日（前一天）的持股数
                 original_amount = position.amount
 
                 # 检查除权事件（送股/配股）
-                exrights_df = self.api.data_context.exrights_dict.get(stock_code)
+                exrights_df = dc.exrights_dict.get(stock_code)
                 if exrights_df is not None and not exrights_df.empty:
-                    date_int = int(date_str)
                     if date_int in exrights_df.index:
                         event = exrights_df.loc[date_int]
                         allotted = float(event.get('allotted_ps', 0) or 0)
@@ -640,10 +711,10 @@ class StrategyExecutionEngine:
                             self.context.portfolio._invalidate_cache()
 
                 # 现金分红（按登记日股数计算）
-                if stock_code not in self.api.data_context.dividend_cache:
+                if stock_code not in dc.dividend_cache:
                     continue
 
-                stock_dividends = self.api.data_context.dividend_cache[stock_code]
+                stock_dividends = dc.dividend_cache[stock_code]
                 if date_str not in stock_dividends:
                     continue
 

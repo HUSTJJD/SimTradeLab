@@ -18,14 +18,13 @@ from collections import OrderedDict
 from datetime import datetime
 from functools import wraps
 from typing import Any, Optional
+import os
+import weakref
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
 from pydantic import BaseModel, Field
-from tqdm import tqdm
 
-from ..utils.performance_config import get_performance_config
 from .cache_manager import cache_manager
 from .code_compat import DualKeyDict, code_candidates
 from .lifecycle_controller import LifecyclePhase
@@ -41,6 +40,44 @@ def _get_load_map():
         'fundamentals': storage.load_fundamentals,
         'exrights': lambda data_dir, k: storage.load_exrights(data_dir, k).get('exrights_events', pd.DataFrame())
     }
+
+
+# DataFrame 列的 numpy 视图缓存（与 PtradeAPI._cached_values 同款思路）：
+# pandas 每次 df[col] 都要构造 Series，多股票循环里按位置取标量是主要开销之一。
+# 按 (id(df), column) 缓存，并用弱引用防止 id 复用后读到过期对象。
+_COLUMN_VALUES_CACHE: dict[tuple[int, str], tuple[Any, np.ndarray]] = {}
+
+
+def _column_values(df: pd.DataFrame, column: str) -> np.ndarray:
+    """返回列的 numpy 视图（不复制数据），按 DataFrame 对象缓存。"""
+    key = (id(df), column)
+    entry = _COLUMN_VALUES_CACHE.get(key)
+    if entry is None or entry[0]() is not df:
+        entry = (
+            weakref.ref(df, lambda _r, _k=key: _COLUMN_VALUES_CACHE.pop(_k, None)),
+            df[column].to_numpy(copy=False),
+        )
+        _COLUMN_VALUES_CACHE[key] = entry
+    return entry[1]
+
+
+# df.iloc[i] 会按所有列的公共 dtype 构造 Series（与 i 无关）。缓存这个 dtype，
+# 让按列视图取出的标量保持与旧 iloc 行完全一致的 dtype（例如混合 float64
+# 价格列 + int64 volume 时，旧 row['volume'] 是 float64 而非 int64）。
+_ROW_DTYPE_CACHE: dict[int, tuple[Any, Any]] = {}
+
+
+def _row_scalar_dtype(df: pd.DataFrame):
+    key = id(df)
+    entry = _ROW_DTYPE_CACHE.get(key)
+    if entry is None or entry[0]() is not df:
+        dtype = df.iloc[0].dtype if len(df) else np.dtype('float64')
+        entry = (
+            weakref.ref(df, lambda _r, _k=key: _ROW_DTYPE_CACHE.pop(_k, None)),
+            dtype,
+        )
+        _ROW_DTYPE_CACHE[key] = entry
+    return entry[1]
 
 
 # ==================== 多进程worker函数 ====================
@@ -91,7 +128,8 @@ class BacktestContext:
 
 class LazyDataDict:
     """延迟加载数据字典（可选全量加载，支持多进程加速）"""
-    def __init__(self, data_dir, data_type, all_keys_list, max_cache_size=6000, preload=False, use_multiprocessing=True):
+    def __init__(self, data_dir, data_type, all_keys_list, max_cache_size=6000,
+                 preload=False, use_multiprocessing=True, skip_empty=False):
         """初始化延迟加载数据字典
 
         Args:
@@ -99,8 +137,9 @@ class LazyDataDict:
             data_type: 数据类型（'stock', 'valuation', 'fundamentals', 'exrights'）
             all_keys_list: 所有可用的key列表
             max_cache_size: 最大缓存数量
-            preload: 是否预加载所有数据
-            use_multiprocessing: 是否使用多进程加载
+            preload: 是否一次性加载全部数据（默认 False，按股票池按需加载）
+            use_multiprocessing: 保留参数兼容；实际并行改用线程池
+            skip_empty: 惰性加载时把空 DataFrame 视为不存在（复现旧 preload 语义）
         """
         self.data_dir = data_dir
         self.data_type = data_type
@@ -112,51 +151,64 @@ class LazyDataDict:
         self._all_keys_set = set(all_keys_list)  # O(1) 查找
         self._max_cache_size = max_cache_size  # 最大缓存数量
         self._preload = preload
+        self._skip_empty = skip_empty
         self._access_count = 0  # 访问计数器
         self._lru_update_interval = 100  # 每N次访问才重新排序
+        self._lazy_misses = 0  # 惰性未命中次数（用于自适应全量兜底）
+        self._auto_warm_done = False
 
-        # 如果启用预加载，一次性加载所有数据到内存
         if preload:
-            config = get_performance_config()
+            # 线程池并行：pyarrow 在 C++ 层读 parquet 会释放 GIL，线程并行
+            # 无需把上万个 DataFrame 跨进程 pickle 回传主进程。实测 600 只
+            # 股票：串行 15.0s / 15 线程 7.4s / loky 15 进程 25.0s。
+            import time
+            from simtradelab.i18n import t
+            workers = min(16, max(2, (os.cpu_count() or 4)))
+            print(t("data.parallel_loading", workers=workers, count=len(all_keys_list)))
+            start_time = time.perf_counter()
+            self.ensure_loaded(all_keys_list, max_workers=workers)
+            print(t("data.parallel_done", time="{:.1f}".format(time.perf_counter() - start_time)))
 
-            # 判断是否使用多进程
-            enable_mp = (use_multiprocessing and
-                        config.enable_multiprocessing and
-                        len(all_keys_list) >= config.min_batch_size)
+    def ensure_loaded(self, keys, max_workers=None) -> None:
+        """批量并行加载 keys 中尚未缓存的数据。
 
-            if enable_mp:
-                # 多进程并行加载
-                num_workers = config.num_workers
-                chunk_size = max(50, len(all_keys_list) // (num_workers * 2))
-                chunks = [all_keys_list[i:i+chunk_size]
-                         for i in range(0, len(all_keys_list), chunk_size)]
+        结果在主线程按请求顺序写入 ``_cache``，因此 OrderedDict 无需加锁，
+        且加载顺序与原实现一致（不改变任何后续遍历/切片结果）。
+        """
+        missing = [
+            key for key in dict.fromkeys(keys)
+            if key in self._all_keys_set and key not in self._cache
+        ]
+        if not missing:
+            return
 
-                from simtradelab.i18n import t
-                print(t("data.parallel_loading", workers=num_workers, count=len(all_keys_list)))
-                import time
-                start_time = time.perf_counter()
+        # 大批量预热时放宽 LRU，避免先加载的股票被淘汰后重复读盘。
+        needed = len(self._cache) + len(missing)
+        if needed > self._max_cache_size:
+            self._max_cache_size = needed
 
-                # 多进程加载
-                results = Parallel(n_jobs=num_workers, backend='loky', verbose=0)(
-                    delayed(_load_data_chunk)(self.data_dir, self.data_type, chunk)
-                    for chunk in chunks
-                )
+        load_func = self._load_map[self.data_type]
 
-                # 合并结果
-                for chunk_result in results:
-                    self._cache.update(chunk_result)
+        def _one(key):
+            try:
+                return key, load_func(self.data_dir, key)
+            except Exception:
+                return key, None
 
-                elapsed = time.perf_counter() - start_time
-                print(t("data.parallel_done", time="{:.1f}".format(elapsed)))
-            else:
-                # 串行加载（带进度条）
-                load_func = self._load_map[self.data_type]
-                for key in tqdm(all_keys_list, desc='  加载', ncols=80, ascii=True,
-                              bar_format='{desc}: {percentage:3.0f}%|{bar}| {n:4d}/{total:4d} [{elapsed}<{remaining}]'):
-                    try:
-                        self._cache[key] = load_func(self.data_dir, key)
-                    except KeyError:
-                        pass
+        if len(missing) == 1:
+            results = [_one(missing[0])]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            workers = max_workers or min(16, max(2, (os.cpu_count() or 4)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_one, missing))
+
+        for key, value in results:
+            if value is None:
+                continue
+            if self._skip_empty and isinstance(value, pd.DataFrame) and value.empty:
+                continue
+            self._cache[key] = value
 
     def __contains__(self, key):
         return key in self._all_keys_set
@@ -174,10 +226,26 @@ class LazyDataDict:
         if self._preload:
             raise KeyError(f"Stock {key} not found")
 
+        # 自适应兜底：动态全市场扫描策略若逐只惰性加载，会退化成单线程
+        # 读 23719 个文件。累计足够多的新 key 后一次性并行预热剩余数据，
+        # 保证最坏情况仍不慢于原「全量预加载」基线。
+        if not self._auto_warm_done:
+            self._lazy_misses += 1
+            if (self._lazy_misses >= 512
+                    and len(self._cache) < len(self._all_keys) // 4):
+                self._auto_warm_done = True
+                self.ensure_loaded(self._all_keys)
+                if key in self._cache:
+                    return self._cache[key]
+
         # 延迟加载模式：缓存未命中，从存储加载
         try:
             load_func = self._load_map[self.data_type]
             value = load_func(self.data_dir, key)
+            if self._skip_empty and (
+                value is None or (isinstance(value, pd.DataFrame) and value.empty)
+            ):
+                raise KeyError(key)
 
             # 添加到缓存
             self._cache[key] = value
@@ -226,6 +294,10 @@ class StockData:
         self._data: Optional[dict[str, Any]] = None  # 延迟加载标记
         self._cached_phase = None  # 缓存的phase,用于判断是否需要重新加载
         self._cached_idx = None  # 缓存的idx,用于判断是否需要重新加载
+        # 一次性缓存当前时间键与日期索引，避免 _ensure_data_loaded 每次重算
+        self._dt_value = None
+        self._date_dict = None
+        self._sorted_i8 = None
 
         if bt_ctx and bt_ctx.stock_data_dict:
             # 策略可写 XSHG/XSHE 等官方全称尾缀，行情字典内部只用 .SS/.SZ
@@ -235,62 +307,85 @@ class StockData:
                     self._stock_df = bt_ctx.stock_data_dict[candidate]
                     break
 
+            if (
+                self._stock_df is not None
+                and isinstance(self._stock_df, pd.DataFrame)
+                and bt_ctx.get_stock_date_index
+            ):
+                self._date_dict, self._sorted_i8 = bt_ctx.get_stock_date_index(self.stock)
+                ctx = bt_ctx.context
+                if ctx is not None and getattr(ctx, 'frequency', '1d') == '1m':
+                    self._dt_value = current_date.value
+                else:
+                    self._dt_value = current_date.normalize().value
+
     def _ensure_data_loaded(self):
         """确保数据已加载（延迟加载）"""
-        # 优化:只在phase或idx变化时重新加载
-        # 因为同一个Data对象在before_trading_start和handle_data之间共享
-        # 需要判断当前phase,如果phase变化则重新加载
+        # 时间键与日期索引已在 __init__ 一次性缓存；这里只保留 phase 判定、
+        # idx 判定和「变化才 reload」。
+        if (
+            self._stock_df is not None
+            and isinstance(self._stock_df, pd.DataFrame)
+            and self._date_dict is not None
+        ):
+            # 通过LifecycleController判断当前阶段
+            controller = self._bt_ctx.context._lifecycle_controller if self._bt_ctx.context else None
+            current_phase = controller.current_phase if controller else None
 
-        # 首次访问时才计算_current_idx（此时phase已正确设置）
-        if self._stock_df is not None and isinstance(self._stock_df, pd.DataFrame):
-            if self._bt_ctx and self._bt_ctx.get_stock_date_index:
-                date_dict, sorted_i8 = self._bt_ctx.get_stock_date_index(self.stock)
-                if self._bt_ctx.context and self._bt_ctx.context.frequency == '1m':
-                    dt_value = self.current_date.value
-                else:
-                    dt_value = self.current_date.normalize().value
+            if current_phase == LifecyclePhase.BEFORE_TRADING_START:
+                # before_trading_start阶段：返回前一交易日数据
+                # searchsorted(side='left') 等价于 bisect_left: 当 dt_value 在数组中时
+                # 返回该元素位置，pos-1 得到前一交易日（必须保留，不能合并掉）
+                pos = self._sorted_i8.searchsorted(self._dt_value, side='left')
+                if pos > 0:
+                    self._current_idx = self._date_dict[self._sorted_i8[pos - 1]]
+            else:
+                # handle_data阶段：返回当日数据
+                if self._dt_value in self._date_dict:
+                    self._current_idx = self._date_dict[self._dt_value]
 
-                # 通过LifecycleController判断当前阶段
-                controller = self._bt_ctx.context._lifecycle_controller if self._bt_ctx.context else None
-                current_phase = controller.current_phase if controller else None
-
-                is_before_trading = (current_phase == LifecyclePhase.BEFORE_TRADING_START)
-
-                if is_before_trading:
-                    # before_trading_start阶段：返回前一交易日数据
-                    # searchsorted(side='left') 等价于 bisect_left: 当 dt_value 在数组中时
-                    # 返回该元素位置，pos-1 得到前一交易日
-                    pos = sorted_i8.searchsorted(dt_value, side='left')
-                    if pos > 0:
-                        self._current_idx = date_dict[sorted_i8[pos - 1]]
-                else:
-                    # handle_data阶段：返回当日数据
-                    if dt_value in date_dict:
-                        self._current_idx = date_dict[dt_value]
-
-                # 优化:只有phase或idx变化时才重新加载
-                if (self._cached_phase != current_phase or
-                    self._cached_idx != self._current_idx or
-                    self._data is None):
-                    self._data = self._load_data()
-                    self._cached_phase = current_phase
-                    self._cached_idx = self._current_idx
+            # 优化:只有phase或idx变化时才重新加载
+            if (self._cached_phase != current_phase or
+                self._cached_idx != self._current_idx or
+                self._data is None):
+                self._data = self._load_data()
+                self._cached_phase = current_phase
+                self._cached_idx = self._current_idx
 
         if self._data is None:
             raise ValueError("股票 %s 在 %s 无可用数据" % (self.stock, self.current_date))
 
     def _load_data(self):
-        """加载股票当日数据并应用前复权"""
+        """加载股票当日数据（不复权；q&a.txt: data[stock].price 为不复权数据）"""
         if self._current_idx is None or self._stock_df is None:
             raise ValueError(f"股票 {self.stock} 在 {self.current_date} 数据加载失败")
 
-        row = self._stock_df.iloc[self._current_idx]
+        # 按列的 numpy 视图按位置取标量，避免 iloc 构造整行 Series；
+        # 行 dtype 归一化保证与旧 row[col] 的 dtype 一致。
+        df = self._stock_df
+        idx = self._current_idx
+        row_dtype = _row_scalar_dtype(df)
+
+        def scalar(column):
+            arr = _column_values(df, column)
+            value = arr[idx]
+            if arr.dtype != row_dtype:
+                try:
+                    return row_dtype.type(value)
+                except (TypeError, ValueError, AttributeError):
+                    return value
+            return value
+
         data = {
-            'close': row['close'],
-            'open': row['open'],
-            'high': row['high'],
-            'low': row['low'],
-            'volume': row['volume']
+            'close': scalar('close'),
+            'open': scalar('open'),
+            'high': scalar('high'),
+            'low': scalar('low'),
+            'volume': scalar('volume'),
+            # api_doc.txt / PTRADE_PARQUET_FORMAT.md: money 是独立的真实
+            # 成交金额字段，不能用 close*volume 推算（两者一般不相等）。
+            # 缺失列回退 nan，与 row.get('money', np.nan) 一致。
+            'money': (scalar('money') if 'money' in df.columns else np.nan),
         }
 
         return data
@@ -345,8 +440,8 @@ class StockData:
     @property
     @ensure_data_loaded
     def money(self):
-        """成交金额"""
-        return self._data['close'] * self._data['volume']
+        """成交金额（平台真实 money 字段）"""
+        return self._data.get('money', np.nan)
 
     @ensure_data_loaded
     def mavg(self, window):
@@ -362,8 +457,8 @@ class StockData:
             raise ValueError(f"股票 {self.stock} 无法计算mavg({window})")
 
         start_idx = max(0, self._current_idx - window + 1)
-        close_prices = self._stock_df.iloc[start_idx:self._current_idx + 1]['close'].values
-        result = np.nanmean(close_prices)
+        close_arr = _column_values(self._stock_df, 'close')
+        result = np.nanmean(close_arr[start_idx:self._current_idx + 1])
 
         # 更新全局缓存
         cache_manager.put('ma_cache', cache_key, result)
@@ -384,9 +479,9 @@ class StockData:
             raise ValueError(f"股票 {self.stock} 无法计算vwap({window})")
 
         start_idx = max(0, self._current_idx - window + 1)
-        slice_df = self._stock_df.iloc[start_idx:self._current_idx + 1]
-        volumes = slice_df['volume'].values
-        closes = slice_df['close'].values
+        end_idx = self._current_idx + 1
+        volumes = _column_values(self._stock_df, 'volume')[start_idx:end_idx]
+        closes = _column_values(self._stock_df, 'close')[start_idx:end_idx]
         total_volume = np.sum(volumes)
 
         if total_volume == 0:

@@ -65,8 +65,10 @@ class BacktestConfig(BaseModel):
     # 性能优化配置
     enable_multiprocessing: bool = True
     num_workers: Optional[int] = Field(default=None, ge=1, description="多进程worker数量")
-    enable_charts: bool = True
-    enable_logging: bool = True
+    # 研究/批量回测默认关闭图表与文件日志（matplotlib 4 子图渲染 + 双写日志开销大）；
+    # 显式传 True 仍可开启，不破坏单次交互式回测。
+    enable_charts: bool = False
+    enable_logging: bool = False
     enable_export: bool = False
 
     # 市场选择: CN=A股, US=美股

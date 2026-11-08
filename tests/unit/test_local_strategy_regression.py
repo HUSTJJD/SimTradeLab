@@ -430,8 +430,15 @@ def test_terminate_worker_process_group_uses_term_then_kill(monkeypatch):
                 raise subprocess.TimeoutExpired("worker", timeout)
             return -signal.SIGKILL
 
+    # Windows 无 os.killpg / signal.SIGKILL：补齐平台缺失的符号，
+    # 使 posix=True 分支的 SIGTERM -> SIGKILL 两段式逻辑仍可在本机验证。
+    if not hasattr(signal, "SIGKILL"):
+        monkeypatch.setattr(regression.signal, "SIGKILL", 9, raising=False)
     monkeypatch.setattr(
-        regression.os, "killpg", lambda process_group, sig: signals.append((process_group, sig))
+        regression.os,
+        "killpg",
+        lambda process_group, sig: signals.append((process_group, sig)),
+        raising=False,
     )
 
     regression._terminate_worker_process(FakeProcess(), posix=True, grace_seconds=0.01)
@@ -458,8 +465,10 @@ def test_terminate_worker_process_has_non_posix_parent_fallback():
             calls.append("wait")
             return -1
 
+    # 显式关闭 windows 分支，验证「既非 posix 也非 windows」时的
+    # terminate -> kill -> wait 回退（否则 Windows 上会走 taskkill 分支）。
     regression._terminate_worker_process(
-        FakeProcess(), posix=False, grace_seconds=0.01
+        FakeProcess(), posix=False, windows=False, grace_seconds=0.01
     )
 
     assert calls == ["terminate", "kill", "wait"]

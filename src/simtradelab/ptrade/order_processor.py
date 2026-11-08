@@ -49,6 +49,10 @@ class OrderProcessor:
         self.log = log
         self.stats_collector = stats_collector
         self.lot_size = 100
+        # 单次订单级 _resolve_bar 结果缓存：get_execution_price 先解析，
+        # 紧随其后的 _get_current_bar_volume 复用同一根 bar（仅当 stock /
+        # is_buy / current_dt 完全匹配，避免卖单退市回退语义被改变）。
+        self._last_resolve: Optional[tuple] = None
 
     def _resolve_bar(self, stock: str, is_buy: bool = True) -> Optional[tuple[pd.DataFrame, int]]:
         """解析当前 bar 的 (stock_df, idx)，失败返回 None。
@@ -110,6 +114,9 @@ class OrderProcessor:
             执行价格，失败返回None
         """
         resolved = self._resolve_bar(stock, is_buy)
+        # 供同一次订单中的 _get_current_bar_volume 复用（带 current_dt 校验，
+        # 跨 bar 的残留缓存不会命中）
+        self._last_resolve = (stock, is_buy, resolved, self.context.current_dt)
         if resolved is None:
             if limit_price is None:
                 self.log.warning(t("order.price_no_data", stock=stock))
@@ -148,7 +155,13 @@ class OrderProcessor:
 
     def _get_current_bar_volume(self, stock: str) -> Optional[int]:
         """Return current-bar volume, or None when no current bar exists."""
-        resolved = self._resolve_bar(stock, is_buy=True)
+        cached = self._last_resolve
+        self._last_resolve = None  # 消费一次，避免跨订单/跨 bar 误用
+        if (cached is not None and cached[0] == stock and cached[1] is True
+                and cached[3] == self.context.current_dt):
+            resolved = cached[2]
+        else:
+            resolved = self._resolve_bar(stock, is_buy=True)
         if resolved is None:
             return None
         stock_df, idx = resolved

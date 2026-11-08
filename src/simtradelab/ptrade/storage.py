@@ -12,6 +12,7 @@
 """
 
 from __future__ import annotations
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -33,10 +34,15 @@ _COLUMN_ALIASES = {"money": "amount", "price": "close"}
 
 
 def ensure_alias_columns(df: pd.DataFrame, *, copy: bool = True) -> pd.DataFrame:
-    """补齐 money/price 别名列。
+    """补齐 PTrade 文档要求的别名列与日线扩展列。
 
     copy=True 时仅在需要补列时复制（适合多次分发的数据）；
     copy=False 时就地补列（适合刚加载、不再共享的 DataFrame）。
+
+    api_doc.txt get_price/get_history 规定默认返回含 ``is_open``、
+    ``unlimited``（int64，仅日线）等字段。数据包未导出这两列，按平台语义
+    从停牌口径推导：停牌日 volume=0 → is_open=0；常规交易日恒有涨跌停
+    限制 → unlimited=0（平台快照未提供无限制标记，不做臆造）。
     """
     out = None
     for name, source in _COLUMN_ALIASES.items():
@@ -44,6 +50,14 @@ def ensure_alias_columns(df: pd.DataFrame, *, copy: bool = True) -> pd.DataFrame
             if out is None:
                 out = df.copy() if copy else df
             out[name] = out[source]
+    if "is_open" not in df.columns and "volume" in df.columns:
+        if out is None:
+            out = df.copy() if copy else df
+        out["is_open"] = (out["volume"].fillna(0) > 0).astype("int64")
+    if "unlimited" not in df.columns:
+        if out is None:
+            out = df.copy() if copy else df
+        out["unlimited"] = np.int64(0)
     return df if out is None else out
 
 

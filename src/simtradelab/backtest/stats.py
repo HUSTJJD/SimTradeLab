@@ -14,6 +14,7 @@
 
 import os
 import json
+from functools import lru_cache
 import numpy as np
 import pandas as pd
 from simtradelab.utils.plot import save_figure
@@ -22,6 +23,7 @@ from simtradelab.utils.perf import timer
 from simtradelab.backtest.backtest_stats import BacktestStats
 
 
+@lru_cache(maxsize=1)
 def _load_index_names():
     """加载指数名称映射
 

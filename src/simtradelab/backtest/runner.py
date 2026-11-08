@@ -60,6 +60,9 @@ class BacktestRunner:
         # 优化模式：跨 trial 共享日期索引缓存
         self._shared_date_index: dict | None = None
 
+        # 日志系统只需初始化一次，避免每次 run 都 basicConfig(force=True) 重建 handler
+        self._logging_configured = False
+
         # 注册信号处理（仅在主线程）
         try:
             signal.signal(signal.SIGINT, self._signal_handler)
@@ -185,8 +188,8 @@ class BacktestRunner:
             # 执行回测
             success = self._execute_backtest(engine, date_range)
 
-            # 优化模式：保存日期索引缓存供后续 trial 复用
-            if config.optimization_mode and self._shared_date_index is None:
+            # 保存日期索引缓存供后续 run 复用（不再限于优化模式）
+            if self._shared_date_index is None:
                 self._shared_date_index = api._stock_date_index
 
             if not success:
@@ -275,6 +278,14 @@ class BacktestRunner:
         Args:
             config: 回测配置
         """
+        if self._logging_configured:
+            # 同一 runner 多次 run：root handler 已由首次配置好，不再
+            # basicConfig(force=True) 重建。图表文件名仍按每次 run 重新生成，
+            # 供 _generate_report 使用。
+            if config.enable_charts:
+                self._chart_filename = config.get_chart_filename()
+            return
+
         import sys
 
         from simtradelab.ptrade import strategy_engine as _se
@@ -304,6 +315,7 @@ class BacktestRunner:
             handlers=handlers,
             force=True
         )
+        self._logging_configured = True
 
     def _create_date_range(self, benchmark_df: pd.DataFrame, start_date, end_date):
         """创建交易日序列
@@ -375,7 +387,12 @@ class BacktestRunner:
         api.lot_size = self._profile.lot_size
         api.has_price_limit = self._profile.has_price_limit
 
-        # 优化模式：复用日期索引缓存
+        # 日期索引按「实际访问到的股票」懒构建即可：PtradeAPI.get_stock_date_index()
+        # 首次访问时构建并写入 self._stock_date_index，结果逐值完全一致。
+        # 这里刻意不调用 api.prebuild_date_index()：全市场 23719 只股票 × 每只
+        # 数千个交易日会一次性生成上亿条 Python dict 条目，实测内存逼近 10GB、
+        # 启动十几分钟，而只用到 10 只股票的策略根本不需要这些索引。
+        # 跨 run 复用仍保留（见 _execute_backtest 后的 _shared_date_index 赋值）。
         if self._shared_date_index is not None:
             api._stock_date_index = self._shared_date_index
 
@@ -531,17 +548,21 @@ class BacktestRunner:
             ]
             
             # 进一步筛选到策略的交易日
-            def get_date_key(d):
-                if hasattr(d, 'date'):
-                    return str(d.date())
-                elif hasattr(d, 'strftime'):
-                    return str(d.strftime('%Y-%m-%d'))
-                else:
-                    return str(d)
-            
-            bm_slice = bm_slice[
-                bm_slice.index.map(get_date_key).isin(trade_dates_set)
-            ]
+            if isinstance(bm_slice.index, pd.DatetimeIndex):
+                # 向量化：strftime 结果与原 get_date_key 的 'YYYY-MM-DD' 逐值一致
+                date_keys = bm_slice.index.strftime('%Y-%m-%d')
+            else:
+                # 非日期索引保留原逐元素映射语义
+                def get_date_key(d):
+                    if hasattr(d, 'date'):
+                        return str(d.date())
+                    elif hasattr(d, 'strftime'):
+                        return str(d.strftime('%Y-%m-%d'))
+                    else:
+                        return str(d)
+                date_keys = bm_slice.index.map(get_date_key)
+
+            bm_slice = bm_slice[date_keys.isin(trade_dates_set)]
             
             if len(bm_slice) > 0:
                 bm_initial = bm_slice['close'].iloc[0]
